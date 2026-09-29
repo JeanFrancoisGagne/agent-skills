@@ -95,7 +95,10 @@ SENSITIVE_NAME_PATTERNS = [
 TRACKED_SENSITIVE_NAME_PATTERNS = [
     CREDENTIAL_FILE_PATTERN,
     re.compile(
-        r"(^|/)\.env(?:$|/|[._-](?!(?:example|sample|template)$)[^/]*)",
+        # Tracked templates may have one profile label before the marker.
+        # Parent-directory checks and all patch-content scans still apply.
+        r"(^|/)\.env(?!(?:[._-]|\.(?a:[a-z0-9][a-z0-9_-]*)\.)"
+        r"(?:example|sample|template)\Z)(?:$|/|[._-][^/]*)",
         re.IGNORECASE,
     ),
     re.compile(r"(^|/)(id_rsa|id_dsa|id_ecdsa|id_ed25519)(\.pub)?$", re.IGNORECASE),

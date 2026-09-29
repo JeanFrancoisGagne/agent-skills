@@ -74,7 +74,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             self.assertNotIn(f"'{disabled_engine}'", harness)
 
     def test_local_bundle_blocks_sensitive_untracked_file(self) -> None:
-        for rel in (".env", "tokens/session.dat", "secrets/local.py"):
+        for rel in (".env", ".env.onprem.example", "tokens/session.dat", "secrets/local.py"):
             with self.subTest(rel=rel), tempfile.TemporaryDirectory() as tempdir:
                 repo = init_repo(Path(tempdir))
                 path = repo / rel
@@ -807,6 +807,13 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "proto/token/session.proto",
             "password_validator.go",
             ".env.example",
+            ".env.sample",
+            ".env-template",
+            ".env_example",
+            "deployment/onprem/.env.onprem.example",
+            "config/.env.production.sample",
+            ".env.qa-us_2.template",
+            ".ENV.LOCAL.EXAMPLE",
             "private/parser.py",
             ".agents/skills/openclaw-secret-scanning-maintainer/SKILL.md",
             "design-tokens/colors.json",
@@ -819,6 +826,45 @@ class AutoreviewHardeningTests(unittest.TestCase):
         ):
             with self.subTest(rel=rel):
                 self.assertIsNone(self.helper["tracked_sensitive_repo_path_risk"](rel))
+
+    def test_profiled_env_template_patch_is_complete_in_all_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            rel = "deployment/.env.production.example"
+            path = repo / rel
+            path.parent.mkdir(parents=True)
+            path.write_text("FEATURE_ENABLED=false\n", encoding="utf-8")
+            git(repo, "add", rel)
+            git(repo, "commit", "-q", "-m", "template baseline")
+            base = git(repo, "rev-parse", "HEAD").strip()
+            value = "SAM_DB_URL=postgresql:///sam?host=/var/run/postgresql&port=5433&user=postgres"
+            path.write_text(value + "\n", encoding="utf-8")
+            bundles = [self.helper["local_bundle"](repo)]
+            git(repo, "add", rel)
+            bundles.append(self.helper["local_bundle"](repo))
+            git(repo, "commit", "-q", "-m", "template change")
+            bundles.extend((self.helper["branch_bundle"](repo, base),
+                            self.helper["commit_bundle"](repo, "HEAD")))
+            for bundle, truncated in bundles:
+                self.assertIn(rel, bundle)
+                self.assertIn("-FEATURE_ENABLED=false", bundle)
+                self.assertIn("+" + value, bundle)
+                self.assertFalse(truncated)
+
+    def test_profiled_env_template_scans_added_removed_and_context_content(self) -> None:
+        rel = "deployment/.env.production.example"
+        secret = "api" + "_key=" + realistic_secret_value()
+        header = f"diff --git a/{rel} b/{rel}\n--- a/{rel}\n+++ b/{rel}\n"
+        for label in ("local staged diff", "local unstaged diff", "branch diff", "commit diff"):
+            for sign in ("+", "-", " "):
+                with self.subTest(label=label, sign=sign):
+                    patch = header + "@@ -1 +1 @@\n" + sign + secret + "\n"
+                    with self.assertRaisesRegex(SystemExit, "secret-like content"):
+                        self.helper["validate_review_patch"](label, [rel], patch)
+            metadata = header + "index " + "AKIA" + "ABCDEFGHIJKLMNOP" + "..1234567 100644\n"
+            with self.subTest(label=label, metadata=True):
+                with self.assertRaisesRegex(SystemExit, "secret-like content"):
+                    self.helper["validate_review_patch"](label, [rel], metadata)
 
     def test_untracked_token_source_paths_remain_reviewable(self) -> None:
         for rel in (
@@ -885,6 +931,21 @@ class AutoreviewHardeningTests(unittest.TestCase):
     def test_tracked_env_variants_remain_sensitive(self) -> None:
         for rel in (
             ".env-local",
+            ".env.onprem",
+            ".env.production.local",
+            ".env.onprem.example.bak",
+            ".env.onprem.example/production",
+            ".env.onprem.examples",
+            ".env..example",
+            ".env.-prod.example",
+            ".env.dev.local.example",
+            ".env_onprem.example",
+            ".env-onprem.example",
+            ".env.onprem.example\n",
+            ".env.onprem.example\r",
+            ".ssh/.env.onprem.example",
+            "credentials/.env.onprem.example",
+            ".config/gcloud/.env.onprem.example",
             ".env_prod",
             ".env/production",
             ".env/example/production",
