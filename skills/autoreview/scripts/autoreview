@@ -4485,7 +4485,7 @@ def safe_credential_lookup_argument(
     }
     if (
         not result_lookup
-        and normalized_target not in {"os.getenv", "os.environ.get"}
+        and normalized_target not in {"os.getenv", "os.environ.get", "os.environ.pop"}
         and normalized_target != "headers.get"
         and not normalized_target.endswith(".headers.get")
     ):
@@ -5245,6 +5245,20 @@ def secret_text_risk(
             )
         ):
             continue
+        if value.endswith("-") and synthetic_secret_fixture(value[:-1], key):
+            # A fixture prefix may be completed by the standard random generator.
+            # Keep its numeric argument exact; scan every following suffix.
+            generated = re.match(
+                r"[ \t]*\+[ \t]*secrets\.token_hex\([ \t]*[1-9][0-9]*[ \t]*\)",
+                text[match.end() :],
+            )
+            if generated is not None and safe_secret_assignment_suffix(
+                text,
+                match.end() + generated.end(),
+                javascript_dialect=javascript_dialect,
+            ):
+                continue
+            return True
         if synthetic_secret_fixture(value, key):
             if safe_secret_assignment_suffix(
                 text,

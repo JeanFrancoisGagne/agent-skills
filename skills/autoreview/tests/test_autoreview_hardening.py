@@ -866,6 +866,59 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 with self.assertRaisesRegex(SystemExit, "secret-like content"):
                     self.helper["validate_review_patch"](label, [rel], metadata)
 
+    def test_python_environment_pop_and_generated_fixture_public_bundles(self) -> None:
+        for content in (
+            'cre' + 'dential = os.environ.pop("OPENAI_API_KEY", "")',
+            'to' + 'ken = os.environ.pop("OPENAI_API_KEY")',
+            'relay_env = {' + json.dumps("OPENAI_API_KEY") + ': os.environ.pop("OPENAI_API_KEY", "")}',
+            'to' + 'ken = "test-token-" + secrets.token_hex(24)',
+            'api' + '_key = "test-api-key-" + secrets.token_hex(32)',
+        ):
+            with self.subTest(content=content), tempfile.TemporaryDirectory() as tempdir:
+                repo = init_repo(Path(tempdir))
+                path = repo / "runtime.py"
+                path.write_text("FEATURE_ENABLED = False\n", encoding="utf-8")
+                git(repo, "add", path.name)
+                git(repo, "commit", "-q", "-m", "baseline")
+                base = git(repo, "rev-parse", "HEAD").strip()
+                path.write_text(content + "\n", encoding="utf-8")
+                bundles = [self.helper["local_bundle"](repo)]
+                git(repo, "add", path.name)
+                bundles.append(self.helper["local_bundle"](repo))
+                git(repo, "commit", "-q", "-m", "reference")
+                bundles.extend((self.helper["branch_bundle"](repo, base),
+                                self.helper["commit_bundle"](repo, "HEAD")))
+                for bundle, truncated in bundles:
+                    self.assertIn("+" + content, bundle)
+                    self.assertFalse(truncated)
+
+    def test_python_environment_pop_and_generated_fixture_keep_secret_refusals(self) -> None:
+        value = realistic_secret_value()
+        expressions = (
+            f'os.environ.pop("OPENAI_API_KEY", "{value}")',
+            f'os.environ.pop("OPENAI_API_KEY", os.getenv("OTHER_API_KEY", "{value}"))',
+            f'os.environ.pop("OPENAI_API_KEY") or "{value}"',
+            f'os.environ.pop("OPENAI_API_KEY", "") + "{value}"',
+            f'os.environ.pop("{value}", "")',
+            'arbitrary.pop("OPENAI_API_KEY", "")',
+            f'"test-token-" + secrets.token_hex("{value}")',
+            f'"test-token-" + secrets.token_hex(24) + "{value}"',
+            f'"test-token-" + secrets.token_hex(24) or "{value}"',
+            f'"test-token-" + secrets.token_hex(24).replace("a", "{value}")',
+            f'"test-token-" + secrets.token_hex(24)["{value}"]',
+            f'"test-token-" + secrets.token_hex(24) # fixture\n + "{value}"',
+            f'"test-token-" + secrets.token_hex(nested("{value}"))',
+            f'"{value}-" + secrets.token_hex(24)',
+            '"test-token-" + arbitrary.token_hex(24)',
+            '"test-password-" + secrets.token_hex(24)',
+        )
+        for expression in expressions:
+            for sign in ("+", "-", " "):
+                with self.subTest(expression=expression, sign=sign):
+                    patch = "@@ -1 +1 @@\n" + sign + "to" + "ken = " + expression + "\n"
+                    with self.assertRaisesRegex(SystemExit, "secret-like content"):
+                        self.helper["validate_review_patch"]("local diff", ["runtime.py"], patch)
+
     def test_untracked_token_source_paths_remain_reviewable(self) -> None:
         for rel in (
             "src/token/parser.py",
