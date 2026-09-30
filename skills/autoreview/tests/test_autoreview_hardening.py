@@ -1018,6 +1018,114 @@ class AutoreviewHardeningTests(unittest.TestCase):
             with self.subTest(paths=paths), self.assertRaisesRegex(SystemExit, "secret-like content"):
                 self.helper["validate_review_patch"]("local diff", paths, patch)
 
+    def test_compose_required_uri_public_bundles(self) -> None:
+        for rel, username, expression, quote in (
+            ("deployment/docker-compose.onprem.yml", "${DB_USER:-sam}",
+             "${DB_PASSWORD" + ":?DB_PASSWORD required \u2014 set in .env}", ""),
+            ("compose.yaml", "reader", "${DB_PASSWORD?set DB_PASSWORD}", '"'),
+            ("compose.prod.yml", "${DB_USER-reader}", "${DB_PASSWORD" + ":?required}", '"'),
+            ("docker-compose.yaml", "${DB_USER}", "${DB_PASSWORD" + ":?required}", ""),
+        ):
+            content = "      DATABASE_URL: " + quote + "postgres:" + "//" + username
+            content += ":" + expression + "@db:5432/knowledge" + quote
+            with self.subTest(rel=rel), tempfile.TemporaryDirectory() as tempdir:
+                repo = init_repo(Path(tempdir))
+                path = repo / rel
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes((content + "\n").encode("utf-8"))
+                untracked, truncated = self.helper["local_bundle"](repo)
+                self.assertIn(json.dumps(content + "\n"), untracked)
+                self.assertFalse(truncated)
+                path.write_text("services: {}\n", encoding="utf-8")
+                git(repo, "add", rel)
+                git(repo, "commit", "-q", "-m", "baseline")
+                base = git(repo, "rev-parse", "HEAD").strip()
+                path.write_text(content + "\n", encoding="utf-8")
+                bundles = [self.helper["local_bundle"](repo)]
+                git(repo, "add", rel)
+                bundles.append(self.helper["local_bundle"](repo))
+                git(repo, "commit", "-q", "-m", "reference")
+                bundles.extend((self.helper["branch_bundle"](repo, base),
+                                self.helper["commit_bundle"](repo, "HEAD")))
+                for bundle, truncated in bundles:
+                    self.assertIn("+" + content, bundle)
+                    self.assertFalse(truncated)
+                for sign in ("+", "-", " "):
+                    patch = f"diff --git a/{rel} b/{rel}\n--- a/{rel}\n+++ b/{rel}\n@@ -1 +1 @@\n"
+                    self.helper["validate_review_patch"]("local diff", [rel], patch + sign + content + "\n")
+
+    def test_compose_required_uri_keeps_secret_refusals(self) -> None:
+        value = realistic_secret_value()
+        required = "${DB_PASSWORD" + ":?set DB_PASSWORD}"
+        cases = [("reader", expression, "") for expression in (
+            value, "${DB_PASSWORD" + ":-" + value + "}", "${DB_PASSWORD-" + value + "}",
+            "${DB_PASSWORD" + ":+" + value + "}", "${DB_PASSWORD+" + value + "}",
+            required + value, value + required, "$" + required,
+            "${DB_PASSWORD" + ":?${OTHER:-" + value + "}}",
+            "${DB_PASSWORD" + ":?set " + "pass" + "word=" + value + "}",
+            "${DB_PASSWORD" + ":?" + '"' + value + '"' + "}",
+        )]
+        cases.extend((
+            ("${DB_USER:-" + value + "}", required, ""),
+            ("reader", required, "/path?" + "pass" + "word=" + value),
+            ("reader", required, "\n      pass" + "word: " + value),
+        ))
+        rel = "deployment/docker-compose.onprem.yml"
+        for username, expression, suffix in cases:
+            content = "      DATABASE_URL: postgres:" + "//" + username
+            content += ":" + expression + "@db/knowledge" + suffix + "\n"
+            for sign in ("+", "-", " "):
+                with self.subTest(username=username, expression=expression, sign=sign):
+                    patch = f"diff --git a/{rel} b/{rel}\n--- a/{rel}\n+++ b/{rel}\n@@ -1 +1 @@\n"
+                    patch += "".join(sign + line + "\n" for line in content.splitlines())
+                    with self.assertRaisesRegex(SystemExit, "secret-like content"):
+                        self.helper["validate_review_patch"]("local diff", [rel], patch)
+
+    def test_compose_required_uri_refuses_literal_and_non_compose_bundles(self) -> None:
+        for rel, expression in (
+            ("docker-compose.yml", "${DB_PASSWORD" + ":-" + realistic_secret_value() + "}"),
+            ("application.yml", "${DB_PASSWORD" + ":?required}"),
+            ("application.ini", "${DB_PASSWORD" + ":?required}"),
+            ("compose.yml.txt", "${DB_PASSWORD" + ":?required}"),
+        ):
+            content = "DATABASE_URL: postgres:" + "//reader:" + expression + "@db/data\n"
+            with self.subTest(rel=rel), tempfile.TemporaryDirectory() as tempdir:
+                repo = init_repo(Path(tempdir))
+                path = repo / rel
+                path.write_text(content, encoding="utf-8")
+                with self.assertRaisesRegex(SystemExit, "secret-like content"):
+                    self.helper["local_bundle"](repo)
+                path.write_text("# baseline\n", encoding="utf-8")
+                git(repo, "add", rel)
+                git(repo, "commit", "-q", "-m", "baseline")
+                base = git(repo, "rev-parse", "HEAD").strip()
+                path.write_text(content, encoding="utf-8")
+                with self.assertRaisesRegex(SystemExit, "secret-like content"):
+                    self.helper["local_bundle"](repo)
+                git(repo, "add", rel)
+                with self.assertRaisesRegex(SystemExit, "secret-like content"):
+                    self.helper["local_bundle"](repo)
+                git(repo, "commit", "-q", "-m", "literal")
+                for mode, args in (("branch_bundle", (repo, base)), ("commit_bundle", (repo, "HEAD"))):
+                    with self.assertRaisesRegex(SystemExit, "secret-like content"):
+                        self.helper[mode](*args)
+
+    def test_compose_required_uri_requires_known_path_and_value_context(self) -> None:
+        content = "DATABASE_URL: postgres:" + "//reader:${DB_PASSWORD" + ":?required}@db/data"
+        rel = "compose.yml"
+        patch = f"diff --git a/{rel} b/{rel}\n--- a/{rel}\n+++ b/{rel}\n@@ -1 +1 @@\n+{content}\n"
+        for paths, candidate in (
+            (["application.yml"], patch),
+            ([rel], "@@ -1 +1 @@\n+" + content + "\n"),
+            ([rel, "application.yml"], patch + patch.replace(rel, "application.yml")),
+            ([rel], patch.replace("DATABASE_URL: ", "command: ")),
+            ([rel], patch.replace("postgres:", "'postgres:").replace("@db/data", "@db/data'")),
+        ):
+            with self.subTest(paths=paths, candidate=candidate):
+                with self.assertRaisesRegex(SystemExit, "secret-like content"):
+                    self.helper["validate_review_patch"]("local diff", paths, candidate)
+        self.assertTrue(self.helper["secret_text_risk"](content))
+
     def test_untracked_token_source_paths_remain_reviewable(self) -> None:
         for rel in (
             "src/token/parser.py",

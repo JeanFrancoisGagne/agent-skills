@@ -3025,7 +3025,9 @@ def uri_authority_end(
                 interpolation_depth -= 1
             cursor += 1
             continue
-        if outer_quote == "`" and text.startswith("${", cursor):
+        # Read the complete expression even when its language is unknown.
+        # Otherwise '?' or spaces can hide a literal credential before '@'.
+        if text.startswith("${", cursor):
             interpolation_depth = 1
             cursor += 2
             continue
@@ -3072,6 +3074,8 @@ def credentialed_uri_risk(
         tuple[int, int, int, tuple[str, int] | None],
         ...,
     ] | None = None,
+    *,
+    compose_source: bool = False,
 ) -> bool:
     for authority_range in (
         authorities if authorities is not None else uri_authority_ranges(text)
@@ -3091,6 +3095,12 @@ def credentialed_uri_risk(
                 credential.username,
                 credential.host,
                 credential.context,
+                compose_source=compose_source,
+            )
+            and not (
+                compose_source
+                and compose_uri_context(text, credential.scheme_start, credential.context)
+                and compose_uri_username_reference(credential.username)
             )
         ):
             return True
@@ -3100,6 +3110,7 @@ def credentialed_uri_risk(
             credential.value,
             credential.host,
             credential.context,
+            compose_source=compose_source,
         ):
             continue
         if credential.has_password or uri_userinfo_literal_risk(
@@ -3136,7 +3147,14 @@ def uri_authority_credential(
     userinfo, authority_separator, host = authority.rpartition("@")
     if not authority_separator:
         return None
-    username, password_separator, password = userinfo.partition(":")
+    # A variable's operator colon is not the user/password separator.
+    # Recognition here only locates credentials; allowance still needs context.
+    variable = re.match(r"\$\{[^{}\r\n]*\}", userinfo)
+    separator_start = variable.end() if variable is not None else 0
+    separator = userinfo.find(":", separator_start)
+    username = userinfo if separator < 0 else userinfo[:separator]
+    password_separator = "" if separator < 0 else ":"
+    password = "" if separator < 0 else userinfo[separator + 1 :]
     has_password = bool(password_separator and password)
     empty_password = bool(password_separator and not password)
     value = password if has_password else (userinfo if not password_separator else username)
@@ -3341,13 +3359,65 @@ def string_contexts_at(
     return contexts
 
 
+def compose_uri_context(
+    text: str, position: int, context: tuple[str, int] | None,
+) -> bool:
+    return (
+        (context is None or context[0] == '"')
+        and config_assignment_context(text, position) is not None
+    )
+
+
+def compose_required_uri_reference(value: str) -> re.Match[str] | None:
+    # Required-value messages are diagnostics, never password defaults.
+    # Nested substitutions, escaping and quoted expressions remain unrecognized.
+    return re.fullmatch(
+        r"\$\{(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?P<operator>:?\?)"
+        r"[^${}\r\n\"'`\\@]*\}", value,
+    )
+
+
+def compose_uri_username_reference(value: str) -> bool:
+    default = re.fullmatch(
+        r"\$\{[A-Za-z_][A-Za-z0-9_]*:?-([A-Za-z0-9_.-]+)\}", value,
+    )
+    return default is not None and not uri_userinfo_literal_risk(default.group(1))
+
+
+def compose_required_uri_variable_ranges(
+    text: str,
+    authorities: tuple[tuple[int, int, int, tuple[str, int] | None], ...],
+) -> tuple[tuple[int, int], ...]:
+    ranges: list[tuple[int, int]] = []
+    for authority in authorities:
+        credential = uri_authority_credential(text, authority)
+        if credential is None or not compose_uri_context(
+            text, credential.scheme_start, credential.context,
+        ):
+            continue
+        reference = compose_required_uri_reference(credential.value)
+        if reference is not None:
+            # The name/operator is a reference, not a password assignment.
+            # Keep the diagnostic and the rest of the URI in all content scans.
+            ranges.append((credential.value_start, credential.value_start + reference.end("operator")))
+    return tuple(ranges)
+
+
 def uri_password_is_interpolated(
     text: str,
     scheme_start: int,
     password: str,
     host: str,
     context: tuple[str, int] | None,
+    *,
+    compose_source: bool = False,
 ) -> bool:
+    if (
+        compose_source
+        and compose_uri_context(text, scheme_start, context)
+        and compose_required_uri_reference(password) is not None
+    ):
+        return True
     if uri_placeholder_password_is_safe(password, host):
         return True
     if context is not None:
@@ -5157,9 +5227,10 @@ def secret_text_risk(
     *,
     javascript_dialect: str | None = None,
     go_source: bool = False,
+    compose_source: bool = False,
 ) -> bool:
     uri_authorities = uri_authority_ranges(text)
-    if credentialed_uri_risk(text, uri_authorities) or basic_authorization_risk(text) or any(
+    if credentialed_uri_risk(text, uri_authorities, compose_source=compose_source) or basic_authorization_risk(text) or any(
         pattern.search(text) for pattern in SECRET_VALUE_PATTERNS
     ):
         return True
@@ -5167,6 +5238,8 @@ def secret_text_risk(
         text,
         uri_authorities,
     )
+    if compose_source:
+        safe_uri_credentials += compose_required_uri_variable_ranges(text, uri_authorities)
     assignment_scan_text = mask_ranges(text, safe_uri_credentials)
     assignment_prefixes = secret_assignment_matches(
         SECRET_ASSIGNMENT_PREFIX_PATTERN,
@@ -5389,9 +5462,11 @@ def require_no_secret_values(
     *,
     javascript_dialect: str | None = None,
     go_source: bool = False,
+    compose_source: bool = False,
 ) -> None:
     if secret_text_risk(
-        text, javascript_dialect=javascript_dialect, go_source=go_source
+        text, javascript_dialect=javascript_dialect, go_source=go_source,
+        compose_source=compose_source,
     ):
         raise SystemExit(
             "refusing to include secret-like content in review bundle; "
@@ -5586,6 +5661,12 @@ def javascript_review_dialect(rel: str) -> str | None:
     return None
 
 
+def compose_review_path(rel: str) -> bool:
+    return re.fullmatch(
+        r"(?:docker-)?compose(?:\.[A-Za-z0-9_-]+)*\.ya?ml", Path(rel).name,
+    ) is not None
+
+
 def git_c_unquote(value: str) -> str | None:
     if len(value) < 2 or value[0] != '"' or value[-1] != '"':
         return None
@@ -5706,6 +5787,9 @@ def validate_review_patch(
                         and rel in expected_paths
                         and Path(rel).suffix == ".go"
                     ),
+                    compose_source=(
+                        rel is not None and rel in expected_paths and compose_review_path(rel)
+                    ),
                 )
     else:
         for content in unified_diff_contents(patch):
@@ -5822,6 +5906,7 @@ def file_bundle_snapshot(
         text,
         javascript_dialect=javascript_review_dialect(rel),
         go_source=Path(rel).suffix == ".go",
+        compose_source=compose_review_path(rel),
     ):
         return "", True, "secret-like content"
     return text, False, None
