@@ -919,6 +919,105 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     with self.assertRaisesRegex(SystemExit, "secret-like content"):
                         self.helper["validate_review_patch"]("local diff", ["runtime.py"], patch)
 
+    def test_go_address_references_public_bundles(self) -> None:
+        for content in (
+            'pointers := map[string]*string{' + json.dumps("nextPageToken")
+            + ': &page.NextPageToken, ' + json.dumps("nextSyncToken")
+            + ': &page.NextSyncToken}',
+            'var to' + 'ken = &storedCredential',
+            'var pass' + 'word = &account.Credentials.Password',
+            'var to' + 'ken = &runtime_token;',
+        ):
+            with self.subTest(content=content), tempfile.TemporaryDirectory() as tempdir:
+                repo = init_repo(Path(tempdir))
+                path = repo / "runtime.go"
+                path.write_bytes((content + "\n").encode("utf-8"))
+                untracked, truncated = self.helper["local_bundle"](repo)
+                self.assertIn(json.dumps(content + "\n"), untracked)
+                self.assertFalse(truncated)
+                path.write_text("package fixture\n", encoding="utf-8")
+                git(repo, "add", path.name)
+                git(repo, "commit", "-q", "-m", "baseline")
+                base = git(repo, "rev-parse", "HEAD").strip()
+                path.write_text("package fixture\n" + content + "\n", encoding="utf-8")
+                bundles = [self.helper["local_bundle"](repo)]
+                git(repo, "add", path.name)
+                bundles.append(self.helper["local_bundle"](repo))
+                git(repo, "commit", "-q", "-m", "reference")
+                bundles.extend((self.helper["branch_bundle"](repo, base),
+                                self.helper["commit_bundle"](repo, "HEAD")))
+                for bundle, truncated in bundles:
+                    self.assertIn("+" + content, bundle)
+                    self.assertFalse(truncated)
+
+    def test_go_address_references_keep_secret_refusals(self) -> None:
+        value = realistic_secret_value()
+        expressions = (
+            f'"{value}"', f'"&{value}"',
+            '"&page.NextPageToken"', '`&page.NextPageToken`',
+            '&page.NextPageToken()',
+            f'&page.NextPageToken("{value}")',
+            f'&page.NextPageToken["{value}"]',
+            '&page.NextPageToken[0]',
+            f'&page.NextPageToken{{"{value}"}}',
+            f'&page.NextPageToken + "{value}"',
+            f'&page.NextPageToken || "{value}"',
+            f'&page.NextPageToken ?? "{value}"',
+            f'&page.NextPageToken\n// reference\n + "{value}"',
+            f'&page.NextPageToken /* reference */ ("{value}")',
+            f'&page.NextPageToken; ' + 'pass' + f'word = "{value}"',
+        )
+        for expression in expressions:
+            for sign in ("+", "-", " "):
+                with self.subTest(expression=expression, sign=sign):
+                    patch = (
+                        "diff --git a/runtime.go b/runtime.go\n"
+                        "--- a/runtime.go\n+++ b/runtime.go\n@@ -1 +1 @@\n"
+                        + sign + "to" + "ken = " + expression + "\n"
+                    )
+                    with self.assertRaisesRegex(SystemExit, "secret-like content"):
+                        self.helper["validate_review_patch"]("local diff", ["runtime.go"], patch)
+
+    def test_go_address_references_refuse_non_go_public_bundles(self) -> None:
+        content = "pass" + "word = &" + realistic_secret_value() + "\n"
+        for suffix in ("properties", "ini"):
+            with self.subTest(suffix=suffix), tempfile.TemporaryDirectory() as tempdir:
+                repo = init_repo(Path(tempdir))
+                path = repo / ("application." + suffix)
+                path.write_text("# configuration\n", encoding="utf-8")
+                git(repo, "add", path.name)
+                git(repo, "commit", "-q", "-m", "baseline")
+                base = git(repo, "rev-parse", "HEAD").strip()
+                path.write_text(content, encoding="utf-8")
+                with self.subTest(mode="unstaged"), self.assertRaisesRegex(SystemExit, "secret-like content"):
+                    self.helper["local_bundle"](repo)
+                git(repo, "add", path.name)
+                with self.subTest(mode="staged"), self.assertRaisesRegex(SystemExit, "secret-like content"):
+                    self.helper["local_bundle"](repo)
+                git(repo, "commit", "-q", "-m", "literal")
+                with self.subTest(mode="branch"), self.assertRaisesRegex(SystemExit, "secret-like content"):
+                    self.helper["branch_bundle"](repo, base)
+                with self.subTest(mode="commit"), self.assertRaisesRegex(SystemExit, "secret-like content"):
+                    self.helper["commit_bundle"](repo, "HEAD")
+                (repo / ("extra." + suffix)).write_text(content, encoding="utf-8")
+                with self.subTest(mode="untracked"), self.assertRaisesRegex(SystemExit, "secret-like content"):
+                    self.helper["local_bundle"](repo)
+
+    def test_go_address_references_require_each_known_go_path(self) -> None:
+        content = "pass" + "word = &storedCredential"
+        go_patch = (
+            "diff --git a/runtime.go b/runtime.go\n"
+            "--- a/runtime.go\n+++ b/runtime.go\n@@ -1 +1 @@\n+" + content + "\n"
+        )
+        for paths, patch in (
+            (["application.ini"], go_patch),
+            (["runtime.go"], "@@ -1 +1 @@\n+" + content + "\n"),
+            (["runtime.go", "application.ini"],
+             go_patch + go_patch.replace("runtime.go", "application.ini")),
+        ):
+            with self.subTest(paths=paths), self.assertRaisesRegex(SystemExit, "secret-like content"):
+                self.helper["validate_review_patch"]("local diff", paths, patch)
+
     def test_untracked_token_source_paths_remain_reviewable(self) -> None:
         for rel in (
             "src/token/parser.py",

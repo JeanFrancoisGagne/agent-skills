@@ -5156,6 +5156,7 @@ def secret_text_risk(
     text: str,
     *,
     javascript_dialect: str | None = None,
+    go_source: bool = False,
 ) -> bool:
     uri_authorities = uri_authority_ranges(text)
     if credentialed_uri_risk(text, uri_authorities) or basic_authorization_risk(text) or any(
@@ -5267,6 +5268,19 @@ def secret_text_risk(
             ):
                 continue
             return True
+        if go_source and not quoted and re.fullmatch(
+            r"&[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*", value
+        ):
+            # Only verified Go paths treat address-of identifiers as references.
+            # Require a boundary so calls, indexes and literals stay refused.
+            if (
+                re.match(r"[ \t]*(?:\r?\n|[,;)\]}]|$)", text[match.end() :])
+                and safe_secret_assignment_suffix(
+                    text, match.end(), javascript_dialect=javascript_dialect
+                )
+            ):
+                continue
+            return True
         if (
             match.group("bare_value") is not None
             and len(value) < 12
@@ -5374,8 +5388,11 @@ def require_no_secret_values(
     text: str,
     *,
     javascript_dialect: str | None = None,
+    go_source: bool = False,
 ) -> None:
-    if secret_text_risk(text, javascript_dialect=javascript_dialect):
+    if secret_text_risk(
+        text, javascript_dialect=javascript_dialect, go_source=go_source
+    ):
         raise SystemExit(
             "refusing to include secret-like content in review bundle; "
             f"clean or redact {label} before running autoreview"
@@ -5684,6 +5701,11 @@ def validate_review_patch(
                     f"{label} {rel or '<unknown>'}",
                     content,
                     javascript_dialect=javascript_dialect,
+                    go_source=(
+                        rel is not None
+                        and rel in expected_paths
+                        and Path(rel).suffix == ".go"
+                    ),
                 )
     else:
         for content in unified_diff_contents(patch):
@@ -5799,6 +5821,7 @@ def file_bundle_snapshot(
     if secret_text_risk(
         text,
         javascript_dialect=javascript_review_dialect(rel),
+        go_source=Path(rel).suffix == ".go",
     ):
         return "", True, "secret-like content"
     return text, False, None
