@@ -1126,6 +1126,76 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     self.helper["validate_review_patch"]("local diff", paths, candidate)
         self.assertTrue(self.helper["secret_text_risk"](content))
 
+    def test_python_control_reference_public_bundles(self) -> None:
+        for header in ("if page_token" + ":", "elif gateway_token" + ":", "while not state.page_token" + ":"):
+            content = header + '\n    args.extend(["--page-reference", page_token])\n'
+            content += "events, next_to" + "ken = fetch_calendar_page(\n"
+            content += "    account_email, from_str, CALENDAR_PAGE_SIZE, page_token\n)\n"
+            with self.subTest(header=header), tempfile.TemporaryDirectory() as tempdir:
+                repo = init_repo(Path(tempdir))
+                path = repo / "calendar.py"
+                path.write_bytes(content.encode("utf-8"))
+                bundle, truncated = self.helper["local_bundle"](repo)
+                self.assertIn(json.dumps(content.splitlines()[0] + "\n"), bundle)
+                self.assertFalse(truncated)
+                git(repo, "add", path.name)
+                git(repo, "commit", "-q", "-m", "baseline")
+                base = git(repo, "rev-parse", "HEAD").strip()
+                path.write_text("# replaced implementation\n", encoding="utf-8")
+                bundles = [self.helper["local_bundle"](repo)]
+                git(repo, "add", path.name)
+                bundles.append(self.helper["local_bundle"](repo))
+                git(repo, "commit", "-q", "-m", "replacement")
+                bundles.extend((self.helper["branch_bundle"](repo, base),
+                                self.helper["commit_bundle"](repo, "HEAD")))
+                for bundle, truncated in bundles:
+                    self.assertIn("-" + header, bundle)
+                    self.assertFalse(truncated)
+                for sign in ("+", "-", " "):
+                    patch = "diff --git a/calendar.py b/calendar.py\n--- a/calendar.py\n+++ b/calendar.py\n@@ -1 +1 @@\n"
+                    patch += "".join(sign + line + "\n" for line in content.splitlines())
+                    self.helper["validate_review_patch"]("local diff", [path.name], patch)
+
+    def test_python_control_reference_keeps_literal_refusals(self) -> None:
+        value = realistic_secret_value()
+        calls = (
+            f'provider.issue_token("{value}")',
+            f'provider.issue_token(source, nested("{value}"))',
+            f'provider.issue_token(source, default="{value}")',
+            f'provider.issue_token(source) or "{value}"',
+            f'provider.issue_token(source) + "{value}"',
+        )
+        contents = ["if page_token:\n    pass" + f'word = "{value}"\n']
+        contents += ["if page_token:\n    rows, next_to" + "ken = " + call + "\n" for call in calls]
+        contents += ["if page_token" + ":\n    rows, next_to" + "ken = provider.issue_token(\n"
+                     + f'        source, nested("{value}")\n    )\n']
+        contents += ['description = """\nif pass' + 'word' + ':\n    ' + value + '\n"""\n']
+        for content in contents:
+            for sign in ("+", "-", " "):
+                with self.subTest(content=content, sign=sign):
+                    patch = "diff --git a/calendar.py b/calendar.py\n--- a/calendar.py\n+++ b/calendar.py\n@@ -1 +1 @@\n"
+                    patch += "".join(sign + line + "\n" for line in content.splitlines())
+                    with self.assertRaisesRegex(SystemExit, "secret-like content"):
+                        self.helper["validate_review_patch"]("local diff", ["calendar.py"], patch)
+
+    def test_python_control_reference_requires_each_known_python_path(self) -> None:
+        content = 'if page_token:\n    args.extend(["--page-reference", page_token])\n'
+        section = "diff --git a/calendar.py b/calendar.py\n--- a/calendar.py\n+++ b/calendar.py\n@@ -1 +1 @@\n"
+        body = "".join("+" + line + "\n" for line in content.splitlines())
+        for paths, patch in (
+            (["application.ini"], section + body),
+            (["calendar.py"], "@@ -1 +1 @@\n" + body),
+            (["calendar.py", "application.ini"], section + body + section.replace("calendar.py", "application.ini") + body),
+        ):
+            with self.subTest(paths=paths), self.assertRaisesRegex(SystemExit, "secret-like content"):
+                self.helper["validate_review_patch"]("local diff", paths, patch)
+        for rel in ("application.ini", "application.yml", "calendar.py.txt"):
+            with self.subTest(rel=rel), tempfile.TemporaryDirectory() as tempdir:
+                repo = init_repo(Path(tempdir))
+                (repo / rel).write_text(content, encoding="utf-8")
+                with self.assertRaisesRegex(SystemExit, "secret-like content"):
+                    self.helper["local_bundle"](repo)
+
     def test_untracked_token_source_paths_remain_reviewable(self) -> None:
         for rel in (
             "src/token/parser.py",

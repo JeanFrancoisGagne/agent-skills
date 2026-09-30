@@ -5209,6 +5209,22 @@ def bare_code_reference(
     )
 
 
+def python_control_reference_ranges(text: str) -> tuple[tuple[int, int], ...]:
+    headers = tuple(re.finditer(
+        r"(?m)^[ \t]*(?:if|elif|while)[ \t]+(?:not[ \t]+)?"
+        r"(?P<reference>[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)"
+        r"[ \t]*(?P<colon>:)[ \t]*(?:#[^\r\n]*)?\r?$", text,
+    ))
+    contexts = string_contexts_at(text, {header.start("reference") for header in headers})
+    # A control-header colon does not assign the next line to its condition.
+    # Mask only the reference/header colon; rescan the untouched body for secrets.
+    return tuple(
+        (header.start("reference"), header.end("colon"))
+        for header in headers
+        if contexts[header.start("reference")] is None
+    )
+
+
 def basic_authorization_risk(text: str) -> bool:
     for match in BASIC_AUTHORIZATION_PATTERN.finditer(text):
         encoded = match.group("credential")
@@ -5228,24 +5244,27 @@ def secret_text_risk(
     javascript_dialect: str | None = None,
     go_source: bool = False,
     compose_source: bool = False,
+    python_source: bool = False,
 ) -> bool:
     uri_authorities = uri_authority_ranges(text)
     if credentialed_uri_risk(text, uri_authorities, compose_source=compose_source) or basic_authorization_risk(text) or any(
         pattern.search(text) for pattern in SECRET_VALUE_PATTERNS
     ):
         return True
-    safe_uri_credentials = interpolated_empty_password_uri_ranges(
+    safe_assignment_ranges = interpolated_empty_password_uri_ranges(
         text,
         uri_authorities,
     )
     if compose_source:
-        safe_uri_credentials += compose_required_uri_variable_ranges(text, uri_authorities)
-    assignment_scan_text = mask_ranges(text, safe_uri_credentials)
+        safe_assignment_ranges += compose_required_uri_variable_ranges(text, uri_authorities)
+    if python_source:
+        safe_assignment_ranges += python_control_reference_ranges(text)
+    assignment_scan_text = mask_ranges(text, safe_assignment_ranges)
     assignment_prefixes = secret_assignment_matches(
         SECRET_ASSIGNMENT_PREFIX_PATTERN,
         text,
         assignment_scan_text,
-        safe_uri_credentials,
+        safe_assignment_ranges,
     )
     chained_assignment_positions = top_level_line_assignment_positions(
         text,
@@ -5273,7 +5292,7 @@ def secret_text_risk(
         SECRET_ASSIGNMENT_PATTERN,
         text,
         assignment_scan_text,
-        safe_uri_credentials,
+        safe_assignment_ranges,
     ):
         quoted = any(
             match.group(name) is not None
@@ -5463,10 +5482,12 @@ def require_no_secret_values(
     javascript_dialect: str | None = None,
     go_source: bool = False,
     compose_source: bool = False,
+    python_source: bool = False,
 ) -> None:
     if secret_text_risk(
         text, javascript_dialect=javascript_dialect, go_source=go_source,
         compose_source=compose_source,
+        python_source=python_source,
     ):
         raise SystemExit(
             "refusing to include secret-like content in review bundle; "
@@ -5790,6 +5811,9 @@ def validate_review_patch(
                     compose_source=(
                         rel is not None and rel in expected_paths and compose_review_path(rel)
                     ),
+                    python_source=(
+                        rel is not None and rel in expected_paths and Path(rel).suffix == ".py"
+                    ),
                 )
     else:
         for content in unified_diff_contents(patch):
@@ -5907,6 +5931,7 @@ def file_bundle_snapshot(
         javascript_dialect=javascript_review_dialect(rel),
         go_source=Path(rel).suffix == ".go",
         compose_source=compose_review_path(rel),
+        python_source=Path(rel).suffix == ".py",
     ):
         return "", True, "secret-like content"
     return text, False, None
