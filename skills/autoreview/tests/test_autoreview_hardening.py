@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import io
 import json
@@ -3799,6 +3800,402 @@ class AutoreviewHardeningTests(unittest.TestCase):
         ):
             with self.subTest(content=content):
                 self.assertFalse(self.helper["secret_text_risk"](content))
+
+    def test_public_bundle_accepts_declared_javascript_credential_references(self) -> None:
+        sources = (
+            'let requestAuth: RequestAuth;\nrequestAuth = lookup();\n'
+            'function resolve() { return { apiKey: requestAuth.apiKey }; }\n',
+            'const selectedApiKey = choose();\n'
+            'function wrap() { return { apiKey: selectedApiKey }; }\n',
+            'const dispatchIdentity = resolve();\n'
+            'function wrap() { return { apiKey: dispatchIdentity["apiKey"] }; }\n',
+            'const suppliedCredential = resolve();\n'
+            'function wrap() { return { token: suppliedCredential?.accessToken }; }\n',
+        )
+        for source in sources:
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as tempdir:
+                repo = init_repo(Path(tempdir))
+                (repo / 'runtime.ts').write_bytes(source.encode('utf-8'))
+                bundle, truncated = self.helper['local_bundle'](repo)
+                self.assertIn(json.dumps(source.splitlines(keepends=True)[-1]), bundle)
+                self.assertFalse(truncated)
+
+    def test_public_bundle_accepts_only_symbolic_javascript_test_credentials(self) -> None:
+        sources = (
+            'it("auth stub", () => {\n'
+            'const lookup = vi.fn().mockResolvedValue({ apiKey: "fixture-api-key" });\n});\n',
+            'it("config presence", () => {\n'
+            'const config = { channels: { service: { token: "fixture-token" } } };\n});\n',
+            'test("auth stub", () => {\n'
+            'const lookup = jest.fn().mockReturnValue({ apiKey: "sample-api-key" });\n});\n',
+            'test("config presence", () => {\n'
+            'const config = { channels: { service: { token: "mock-token" } } };\n});\n',
+        )
+        for source in sources:
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as tempdir:
+                repo = init_repo(Path(tempdir))
+                (repo / 'presence.test.ts').write_bytes(source.encode('utf-8'))
+                bundle, truncated = self.helper['local_bundle'](repo)
+                self.assertIn(json.dumps(source.splitlines(keepends=True)[1]), bundle)
+                self.assertFalse(truncated)
+
+    def test_public_bundle_keeps_credential_refusals_beside_declared_references(self) -> None:
+        value = realistic_secret_value()
+        encoded = ''.join('\\x' + format(ord(char), '02x') for char in value)
+        expressions = (
+            f'"{value}"', '"actual-production-secret"',
+            f'selectedApiKey + "{value}"', f'requestAuth.apiKey ?? "{value}"',
+            f'requestAuth.apiKey + atob("{base64.b64encode(value.encode()).decode()}")',
+            f'"{encoded}"', '"postgres://reader:actual-password@host/db"',
+            '"requestAuth.apiKey"', '"selectedApiKey"',
+            '"github-token" + "actual-production-secret"',
+            '"configured" + "actual-production-secret"',
+        )
+        for expression in expressions:
+            with self.subTest(expression=expression), tempfile.TemporaryDirectory() as tempdir:
+                repo = init_repo(Path(tempdir))
+                source = 'const selectedApiKey = lookup();\nlet requestAuth = lookup();\n'
+                source += f'it("fixture", () => {{ return {{ apiKey: {expression} }}; }});\n'
+                (repo / 'auth.test.ts').write_text(source, encoding='utf-8')
+                with self.assertRaisesRegex(SystemExit, 'secret-like content'):
+                    self.helper['local_bundle'](repo)
+
+    def test_symbolic_test_credential_rules_do_not_apply_to_runtime_or_data(self) -> None:
+        source = 'it("fixture", () => { return { token: "configured", apiKey: "github-token" }; });\n'
+        for relative in ('runtime.ts', 'config.yml', 'fixture.test.txt'):
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as tempdir:
+                repo = init_repo(Path(tempdir))
+                (repo / relative).write_text(source, encoding='utf-8')
+                with self.assertRaisesRegex(SystemExit, 'secret-like content'):
+                    self.helper['local_bundle'](repo)
+
+    def test_public_scanner_refuses_literal_backed_and_forged_javascript_bindings(self) -> None:
+        sources = (
+            'const dispatchIdentity = "A7f9K2m4Q8v6N3x5R1p0T9z8";\n'
+            'return { apiKey: dispatchIdentity };\n',
+            'const dispatchIdentity = "A7f9" + "K2m4";\n'
+            'return { apiKey: dispatchIdentity };\n',
+            'let dispatchIdentity;\ndispatchIdentity = atob("QTdmOUsybTRROHY2");\n'
+            'return { apiKey: dispatchIdentity };\n',
+            '// const dispatchIdentity = lookup();\nreturn { apiKey: dispatchIdentity };\n',
+            'const note = "const dispatchIdentity = lookup();";\n'
+            'return { apiKey: dispatchIdentity };\n',
+            'const note = /const dispatchIdentity = lookup/;\n'
+            'return { apiKey: dispatchIdentity };\n',
+        )
+        for source in sources:
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as tempdir:
+                repo = Path(tempdir)
+                path = repo / 'runtime.ts'
+                path.write_bytes(source.encode())
+                self.assertEqual(self.helper['file_bundle_snapshot'](repo, path, path.name)[2],
+                                 'secret-like content')
+
+    def test_public_scanner_refuses_real_literals_in_javascript_tests(self) -> None:
+        for value in ('stolen-token', 'stolen-key', 'compromised', 'abandoned'):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as tempdir:
+                repo = Path(tempdir)
+                path = repo / 'lookup.test.ts'
+                path.write_bytes(('it("unrelated", () => {});\n'
+                                  f'const config = {{ apiKey: "{value}" }};\n').encode())
+                self.assertEqual(self.helper['file_bundle_snapshot'](repo, path, path.name)[2],
+                                 'secret-like content')
+
+    def test_public_scanner_refuses_javascript_initializer_alias_literals(self) -> None:
+        sources = (
+            'const sourceValue = "A7f9K2m4Q8v6N3x5R1p0T9z8";\n'
+            'const dispatchIdentity = sourceValue;\n',
+            'const sourceValue = "A7f9K2m4Q8v6N3x5R1p0T9z8";\n'
+            'const firstIdentity = sourceValue;\n'
+            'const nextIdentity = firstIdentity;\n'
+            'const dispatchIdentity = nextIdentity;\n',
+            'let sourceValue = lookup();\n'
+            'const dispatchIdentity = sourceValue;\n'
+            'sourceValue = "A7f9K2m4Q8v6N3x5R1p0T9z8";\n',
+            'let sourceValue = lookup();\n'
+            'const dispatchIdentity = sourceValue;\n'
+            'sourceValue += "A7f9K2m4Q8v6N3x5R1p0T9z8";\n',
+            'const dispatchIdentity = sourceValue;\n'
+            'const sourceValue = atob("QTdmOUsybTRROHY2TjN4NVIxcDBUOXo4");\n',
+            'const sourceValue = "postgres://reader:actual-password@host/db";\n'
+            'const dispatchIdentity = sourceValue;\n',
+            'const sourceValue = "A7f9K2m4Q8v6N3x5R1p0T9z8";\n'
+            'const dispatchIdentity = condition ? sourceValue : lookup();\n',
+        )
+        for source in sources:
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as tempdir:
+                repo = Path(tempdir)
+                path = repo / 'runtime.ts'
+                path.write_bytes((source + 'function resolve() { return { apiKey: dispatchIdentity }; }\n').encode())
+                self.assertEqual(self.helper['file_bundle_snapshot'](repo, path, path.name)[2],
+                                 'secret-like content')
+
+    def test_public_scanner_refuses_javascript_numeric_initializer_construction(self) -> None:
+        sources = (
+            'const dispatchIdentity = String.fromCharCode(65, 55, 102, 57, 75, 50, 109, 52, 81, 56, 118, 54, 78, 51, 120, 53, 82, 49, 112, 48, 84, 57, 122, 56);\n',
+            'const sourceValues = [65, 55, 102, 57];\n'
+            'const dispatchIdentity = String.fromCharCode(...sourceValues);\n',
+            'const sourceValues = [0x41, 0x37, 0x66, 0x39];\n'
+            'const dispatchIdentity = String.fromCodePoint(...sourceValues);\n',
+            'let sourceValues = lookup();\n'
+            'const dispatchIdentity = String.fromCharCode(...sourceValues);\n'
+            'sourceValues = [0b1000001, 0o67, 1_02, 57];\n',
+        )
+        for source in sources:
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as tempdir:
+                repo = Path(tempdir)
+                path = repo / 'runtime.ts'
+                path.write_bytes((source + 'function resolve() { return { apiKey: dispatchIdentity }; }\n').encode())
+                self.assertEqual(self.helper['file_bundle_snapshot'](repo, path, path.name)[2],
+                                 'secret-like content')
+
+    def test_public_scanner_bounds_javascript_initializer_alias_cycles_and_depth(self) -> None:
+        sources = (
+            'const dispatchIdentity = dispatchIdentity;\n',
+            'const firstIdentity = nextIdentity;\n'
+            'const nextIdentity = firstIdentity;\n'
+            'const dispatchIdentity = firstIdentity;\n',
+            'const firstIdentity = nextIdentity;\n'
+            'const nextIdentity = firstIdentity;\n'
+            'nextIdentity = "A7f9K2m4Q8v6N3x5R1p0T9z8";\n'
+            'const dispatchIdentity = firstIdentity;\n',
+            'const referenceValue0 = lookup();\n'
+            + ''.join(f'const referenceValue{i} = referenceValue{i - 1};\n' for i in range(1, 32))
+            + 'const dispatchIdentity = referenceValue31;\n',
+        )
+        for source in sources:
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as tempdir:
+                repo = Path(tempdir)
+                path = repo / 'runtime.ts'
+                path.write_bytes((source + 'function resolve() { return { apiKey: dispatchIdentity }; }\n').encode())
+                self.assertEqual(self.helper['file_bundle_snapshot'](repo, path, path.name)[2],
+                                 'secret-like content')
+
+    def test_public_source_evidence_preserves_nonliteral_javascript_aliases(self) -> None:
+        sources = (
+            'const firstIdentity = lookup();\n'
+            'const nextIdentity = firstIdentity;\n'
+            'const dispatchIdentity = nextIdentity;\n',
+            'let firstIdentity = lookup();\n'
+            'const dispatchIdentity = firstIdentity;\n'
+            'firstIdentity = refresh();\n',
+            'const firstIdentity = lookup();\n'
+            'const nextIdentity = firstIdentity;\n'
+            'const dispatchIdentity = firstIdentity ?? nextIdentity;\n',
+            'const sourceValue24 = lookup(/* 65, "actual-secret" */);\n'
+            'const dispatchIdentity = sourceValue24;\n',
+            'const provider = "ordinary-service";\n'
+            'const dispatchIdentity = lookup({ provider: params.provider });\n',
+            'const referenceValue0 = lookup();\n'
+            + ''.join(f'const referenceValue{i} = referenceValue{i - 1};\n' for i in range(1, 30))
+            + 'const dispatchIdentity = referenceValue29;\n',
+        )
+        for source in sources:
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as tempdir:
+                repo = Path(tempdir)
+                path = repo / 'runtime.ts'
+                source += 'function resolve() { return { apiKey: dispatchIdentity }; }\n'
+                path.write_bytes(source.encode())
+                _, content, truncated = self.helper['validate_evidence_file'](repo, path.name, '--dataset')
+                self.assertEqual(content, source)
+                self.assertFalse(truncated)
+
+    def test_public_source_evidence_preserves_reference_scan_context(self) -> None:
+        source = ('let requestAuth: RequestAuth;\nrequestAuth = lookup();\n'
+                  'return { apiKey: requestAuth.apiKey };\n')
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = Path(tempdir)
+            (repo / 'runtime.ts').write_bytes(source.encode())
+            _, content, truncated = self.helper['validate_evidence_file'](repo, 'runtime.ts', '--dataset')
+            self.assertEqual(content, source)
+            self.assertFalse(truncated)
+
+    def test_public_scanner_refuses_local_javascript_callee_literal_origins(self) -> None:
+        sources = (
+            'function getDispatchIdentity() { return "A7f9K2m4Q8v6N3x5R1p0T9z8"; }\n',
+            'const sourceValue = "A7f9K2m4Q8v6N3x5R1p0T9z8";\n'
+            'function getDispatchIdentity() { return sourceValue; }\n',
+            'function getDispatchIdentity(value = "A7f9K2m4Q8v6N3x5R1p0T9z8") { return arguments[0]; }\n',
+            'function getDispatchIdentity() { return String.fromCharCode(65, 55, 102, 57); }\n',
+            'function getDispatchIdentity(): { opaque: string }\n'
+            '{ return { opaque: "A7f9K2m4Q8v6N3x5R1p0T9z8" }; }\n',
+            'function getDispatchIdentity() { return getDispatchIdentity(); }\n',
+        )
+        for source in sources:
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as tempdir:
+                repo = Path(tempdir)
+                path = repo / 'runtime.ts'
+                path.write_bytes((source + 'const dispatchIdentity = getDispatchIdentity();\n'
+                                  'function resolve() { return { apiKey: dispatchIdentity }; }\n').encode())
+                self.assertEqual(self.helper['file_bundle_snapshot'](repo, path, path.name)[2],
+                                 'secret-like content')
+
+    def test_public_scanner_refuses_javascript_literal_object_property_origins(self) -> None:
+        source = ('const sourceValue = { opaque: "A7f9K2m4Q8v6N3x5R1p0T9z8" };\n'
+                  'const dispatchIdentity = sourceValue.opaque;\n'
+                  'function resolve() { return { apiKey: dispatchIdentity }; }\n')
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = Path(tempdir)
+            path = repo / 'runtime.ts'
+            path.write_bytes(source.encode())
+            self.assertEqual(self.helper['file_bundle_snapshot'](repo, path, path.name)[2],
+                             'secret-like content')
+
+    def test_public_source_evidence_preserves_nonliteral_local_javascript_callees(self) -> None:
+        sources = (
+            'function getDispatchIdentity() { return lookup(); }\n',
+            'function getDispatchIdentity(value = lookup()) { return value; }\n',
+            'async function getDispatchIdentity(params: { sourceValue?: string }): Promise<string | undefined> {\n'
+            'const selectedValue = params.sourceValue?.trim();\n'
+            'if (selectedValue) { return selectedValue; }\n'
+            'return lookup(params);\n}\n',
+        )
+        for source in sources:
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as tempdir:
+                repo = Path(tempdir)
+                path = repo / 'runtime.ts'
+                source += ('const dispatchIdentity = getDispatchIdentity(params);\n'
+                           'function resolve() { return { apiKey: dispatchIdentity }; }\n')
+                path.write_bytes(source.encode())
+                _, content, truncated = self.helper['validate_evidence_file'](repo, path.name, '--dataset')
+                self.assertEqual(content, source)
+                self.assertFalse(truncated)
+
+    def test_public_evidence_preserves_typed_registry_and_selected_return_values(self) -> None:
+        source = (
+            'type RegistryContract = { lookup(model: Context["model"]): Promise<AuthResult> };\n'
+            'async function resolveIdentity(ctx: Context, model: Model): Promise<\n'
+            '  { ok: true; selectedValue?: string } | { ok: false; reason: string }\n'
+            '> {\n'
+            '  const registry = ctx.registry as RegistryContract;\n'
+            '  if (typeof registry.lookup !== "function") {\n'
+            '    log.warn("registry lookup unavailable");\n'
+            '    return { ok: false, reason: "registry lookup unavailable", };\n'
+            '  }\n'
+            '  let requestAuth: AuthResult;\n'
+            '  requestAuth = await registry.lookup(model);\n'
+            '  return { ok: true, selectedValue: requestAuth.apiKey };\n'
+            '}\n'
+            'const authResult = await resolveIdentity(ctx, model);\n'
+            'function dispatch() { return { apiKey: authResult.selectedValue }; }\n'
+        )
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = Path(tempdir)
+            (repo / 'runtime.ts').write_bytes(source.encode())
+            _, content, truncated = self.helper['validate_evidence_file'](repo, 'runtime.ts', '--dataset')
+            self.assertEqual(content, source)
+            self.assertFalse(truncated)
+
+    def test_public_scanner_keeps_literal_origins_after_type_and_return_selection(self) -> None:
+        sources = (
+            'type ResultContract = { opaque: string };\n'
+            'const sourceValue = "A7f9K2m4Q8v6N3x5R1p0T9z8";\n'
+            'const dispatchIdentity = sourceValue as ResultContract;\n'
+            'function dispatch() { return { apiKey: dispatchIdentity }; }\n',
+            'function resolveIdentity(): Promise<{ opaque: string }> {\n'
+            'return { opaque: "A7f9K2m4Q8v6N3x5R1p0T9z8" };\n}\n'
+            'const dispatchIdentity = resolveIdentity();\n'
+            'function dispatch() { return { apiKey: dispatchIdentity.opaque }; }\n',
+            'const sourceValues = [65, 55, 102, 57];\n'
+            'function resolveIdentity() { return { opaque: String.fromCharCode(...sourceValues) }; }\n'
+            'const dispatchIdentity = resolveIdentity();\n'
+            'function dispatch() { return { apiKey: dispatchIdentity.opaque }; }\n',
+            'function resolveIdentity() {\n'
+            'const sourceValue = { opaque: lookup() };\n'
+            'sourceValue.opaque = "A7f9K2m4Q8v6N3x5R1p0T9z8";\n'
+            'return sourceValue.opaque;\n}\n'
+            'const dispatchIdentity = resolveIdentity();\n'
+            'function dispatch() { return { apiKey: dispatchIdentity }; }\n',
+            'function resolveIdentity() {\n'
+            'const sourceValue = { opaque: lookup() };\n'
+            'sourceValue["opaque"] = "A7f9K2m4Q8v6N3x5R1p0T9z8";\n'
+            'return sourceValue.opaque;\n}\n'
+            'const dispatchIdentity = resolveIdentity();\n'
+            'function dispatch() { return { apiKey: dispatchIdentity }; }\n',
+            'function resolveIdentity() {\n'
+            'const { sourceValue } = { sourceValue: "A7f9K2m4Q8v6N3x5R1p0T9z8" };\n'
+            'return sourceValue;\n}\n'
+            'const dispatchIdentity = resolveIdentity();\n'
+            'function dispatch() { return { apiKey: dispatchIdentity }; }\n',
+        )
+        for source in sources:
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as tempdir:
+                repo = Path(tempdir)
+                path = repo / 'runtime.ts'
+                path.write_bytes(source.encode())
+                self.assertEqual(self.helper['file_bundle_snapshot'](repo, path, path.name)[2],
+                                 'secret-like content')
+
+    def test_public_bundle_refuses_nested_computed_return_origin_mutation(self) -> None:
+        source = (
+            'function resolveIdentity() {\n'
+            '  const sourceValue = { auth: { opaque: lookup() } };\n'
+            '  sourceValue.auth["opaque"] = "A7f9K2m4Q8v6N3x5R1p0T9z8";\n'
+            '  return sourceValue.auth.opaque;\n'
+            '}\n'
+            'const dispatchIdentity = resolveIdentity();\n'
+            'function dispatch() { return { apiKey: dispatchIdentity }; }\n'
+        )
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            (repo / 'runtime.ts').write_bytes(source.encode())
+            with self.assertRaisesRegex(SystemExit, 'secret-like content'):
+                self.helper['local_bundle'](repo)
+
+    def test_public_bundle_refuses_reverse_alias_return_origin_mutation(self) -> None:
+        source = (
+            'function resolveIdentity() {\n'
+            '  const sourceValue = { opaque: lookup() };\n'
+            '  const mutableValue = sourceValue;\n'
+            '  mutableValue.opaque = "A7f9K2m4Q8v6N3x5R1p0T9z8";\n'
+            '  return sourceValue.opaque;\n'
+            '}\n'
+            'const dispatchIdentity = resolveIdentity();\n'
+            'function dispatch() { return { apiKey: dispatchIdentity }; }\n'
+        )
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            (repo / 'runtime.ts').write_bytes(source.encode())
+            with self.assertRaisesRegex(SystemExit, 'secret-like content'):
+                self.helper['local_bundle'](repo)
+
+    def test_public_bundle_refuses_object_assign_return_origin_mutation(self) -> None:
+        source = (
+            'function resolveIdentity() {\n'
+            '  const sourceValue = { opaque: lookup() };\n'
+            '  Object.assign(sourceValue, { opaque: "A7f9K2m4Q8v6N3x5R1p0T9z8" });\n'
+            '  return sourceValue.opaque;\n'
+            '}\n'
+            'const dispatchIdentity = resolveIdentity();\n'
+            'function dispatch() { return { apiKey: dispatchIdentity }; }\n'
+        )
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            (repo / 'runtime.ts').write_bytes(source.encode())
+            with self.assertRaisesRegex(SystemExit, 'secret-like content'):
+                self.helper['local_bundle'](repo)
+
+    def test_public_bundle_refuses_computed_mutations_with_inner_semicolons(self) -> None:
+        mutations = (
+            'sourceValue[(() => { ; })() || "opaque"] = "A7f9K2m4Q8v6N3x5R1p0T9z8";',
+            'sourceValue[[(() => { ; })() || "opaque"][0]] = "A7f9K2m4Q8v6N3x5R1p0T9z8";',
+            'Object[(() => { ; })() || "assign"](sourceValue, { opaque: "A7f9K2m4Q8v6N3x5R1p0T9z8" });',
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as tempdir:
+                repo = init_repo(Path(tempdir))
+                source = (
+                    'function resolveIdentity() {\n'
+                    '  const sourceValue = { opaque: lookup() };\n'
+                    + '  ' + mutation + '\n'
+                    '  return sourceValue.opaque;\n'
+                    '}\n'
+                    'const dispatchIdentity = resolveIdentity();\n'
+                    'function dispatch() { return { apiKey: dispatchIdentity }; }\n'
+                )
+                (repo / 'runtime.ts').write_bytes(source.encode())
+                with self.assertRaisesRegex(SystemExit, 'secret-like content'):
+                    self.helper['local_bundle'](repo)
 
     def test_synthetic_secret_fixture_prefixes_are_generic(self) -> None:
         for prefix in self.helper["SYNTHETIC_SECRET_PREFIXES"]:
