@@ -1165,8 +1165,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
             f'provider.issue_token(source) or "{value}"',
             f'provider.issue_token(source) + "{value}"',
         )
-        contents = ["if page_token:\n    pass" + f'word = "{value}"\n']
-        contents += ["if page_token:\n    rows, next_to" + "ken = " + call + "\n" for call in calls]
+        contents = ["if page_to" + "ken:\n    pass" + f'word = "{value}"\n']
+        contents += ["if page_to" + "ken:\n    rows, next_to" + "ken = " + call + "\n" for call in calls]
         contents += ["if page_token" + ":\n    rows, next_to" + "ken = provider.issue_token(\n"
                      + f'        source, nested("{value}")\n    )\n']
         contents += ['description = """\nif pass' + 'word' + ':\n    ' + value + '\n"""\n']
@@ -1179,7 +1179,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                         self.helper["validate_review_patch"]("local diff", ["calendar.py"], patch)
 
     def test_python_control_reference_requires_each_known_python_path(self) -> None:
-        content = 'if page_token:\n    args.extend(["--page-reference", page_token])\n'
+        content = 'if page_to' + 'ken:\n    args.extend(["--page-reference", page_token])\n'
         section = "diff --git a/calendar.py b/calendar.py\n--- a/calendar.py\n+++ b/calendar.py\n@@ -1 +1 @@\n"
         body = "".join("+" + line + "\n" for line in content.splitlines())
         for paths, patch in (
@@ -1195,6 +1195,454 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 (repo / rel).write_text(content, encoding="utf-8")
                 with self.assertRaisesRegex(SystemExit, "secret-like content"):
                     self.helper["local_bundle"](repo)
+
+    def test_python_mapping_references_public_bundles(self) -> None:
+        page_field, sync_field = "nextPageToken", "nextSyncToken"
+        contents = (
+            f'value = {{{page_field!r}: page.get({sync_field!r}, "")}}\n',
+            f'value = {{**({{{page_field!r}: str(offset + size)}} if more else '
+            f'{{{sync_field!r}: current}})}}\n',
+            'to' + 'ken = retained["result"]["cursor"]\n',
+            'to' + 'ken = {"route": current, "value": retained[0], "parts": [state.cursor]}\n',
+            'to' + f'ken = resolve(page.get({page_field!r}, fallback.get("cursor", "")))\n',
+        )
+        for content in contents:
+            with self.subTest(content=content), tempfile.TemporaryDirectory() as tempdir:
+                repo = init_repo(Path(tempdir))
+                path = repo / "reader.py"
+                path.write_bytes(content.encode())
+                bundle, truncated = self.helper["local_bundle"](repo)
+                self.assertIn(json.dumps(content), bundle)
+                self.assertFalse(truncated)
+                git(repo, "add", path.name)
+                git(repo, "commit", "-q", "-m", "reference")
+                base = git(repo, "rev-parse", "HEAD").strip()
+                path.write_text("# replacement\n", encoding="utf-8")
+                bundles = [self.helper["local_bundle"](repo)]
+                git(repo, "add", path.name)
+                bundles.append(self.helper["local_bundle"](repo))
+                git(repo, "commit", "-q", "-m", "replacement")
+                bundles.extend((self.helper["branch_bundle"](repo, base),
+                                self.helper["commit_bundle"](repo, "HEAD")))
+                for bundle, truncated in bundles:
+                    self.assertIn("-" + content.strip(), bundle)
+                    self.assertFalse(truncated)
+                for sign in ("+", "-", " "):
+                    patch = "diff --git a/reader.py b/reader.py\n--- a/reader.py\n+++ b/reader.py\n@@ -1 +1 @@\n" + sign + content
+                    self.helper["validate_review_patch"]("local diff", [path.name], patch)
+
+    def test_python_mapping_references_keep_literals_and_defaults(self) -> None:
+        value = realistic_secret_value()
+        page_field, sync_field = "nextPageToken", "nextSyncToken"
+        expressions = (
+            f'"{value}"',
+            f'page.get({page_field!r}, "{value}")',
+            f'page.get({page_field!r}, nested("{value}"))',
+            'os.getenv(default="CORRECT' + 'HORSEBATTERYSTAPLE")',
+            'page.get("cursor", os.environ.get(default="CORRECT' + 'HORSEBATTERYSTAPLE"))',
+            f'resolve(page.get({page_field!r}, fallback.get("cursor", "{value}")))',
+            f'page.get({page_field!r}) or "{value}"',
+            f'page.get({page_field!r}) + "{value}"',
+            f'page.get("{value}")',
+            'page.get("CORRECT' + 'HORSEBATTERYSTAPLE")',
+            f'page["{value}"]',
+            f'retained["result"]["cursor"] or "{value}"',
+            f'arbitrary({page_field!r}, "{value}")',
+            f'{{"field": "{value}"}} if more else current',
+            f'current if more else {{"field": "{value}"}}',
+            f'{{{page_field!r}: str(size)}} if more else {{{sync_field!r}: "{value}"}}',
+        )
+        for expression in expressions:
+            for sign in ("+", "-", " "):
+                with self.subTest(expression=expression, sign=sign):
+                    patch = "diff --git a/reader.py b/reader.py\n--- a/reader.py\n+++ b/reader.py\n@@ -1 +1 @@\n"
+                    patch += sign + "to" + "ken = " + expression + "\n"
+                    with self.assertRaisesRegex(SystemExit, "secret-like content"):
+                        self.helper["validate_review_patch"]("local diff", ["reader.py"], patch)
+
+    def test_python_mapping_references_require_known_python_paths(self) -> None:
+        content = 'to' + 'ken = retained["result"]["cursor"]\n'
+        section = "diff --git a/reader.py b/reader.py\n--- a/reader.py\n+++ b/reader.py\n@@ -1 +1 @@\n+" + content
+        for paths, patch in (
+            (["reader.ini"], section),
+            (["reader.py"], "@@ -1 +1 @@\n+" + content),
+            (["reader.py", "reader.ini"], section + section.replace("reader.py", "reader.ini")),
+        ):
+            with self.subTest(paths=paths), self.assertRaisesRegex(SystemExit, "secret-like content"):
+                self.helper["validate_review_patch"]("local diff", paths, patch)
+
+    def test_python_mapping_metadata_literals_remain_refused(self) -> None:
+        # A status-shaped key does not establish whether its text is a secret.
+        field = "blocked_password"
+        for value in (realistic_secret_value(), "correct horse battery staple"):
+            content = f'messages = {{{field!r}: {value!r}}}\n'
+            for sign in ("+", "-", " "):
+                patch = "diff --git a/reader.py b/reader.py\n--- a/reader.py\n+++ b/reader.py\n@@ -1 +1 @@\n" + sign + content
+                with self.assertRaisesRegex(SystemExit, "secret-like content"):
+                    self.helper["validate_review_patch"]("local diff", ["reader.py"], patch)
+
+    def test_python_mapping_parser_work_is_bounded(self) -> None:
+        field = "nextPageToken"
+        content = (f'value = {{{field!r}: page.get({field!r}, "")}}\n') * 256
+        patch_header = "diff --git a/reader.py b/reader.py\n--- a/reader.py\n+++ b/reader.py\n@@ -1 +1 @@\n"
+        ast_module = self.helper["ast"]
+        parse = ast_module.parse
+        parsed_lengths = []
+
+        def bounded_parse(source, *args, **kwargs):
+            parsed_lengths.append(len(source))
+            return parse(source, *args, **kwargs)
+
+        with mock.patch.object(ast_module, "parse", side_effect=bounded_parse):
+            self.helper["validate_review_patch"](
+                "local diff", ["reader.py"],
+                patch_header + "".join("+" + line + "\n" for line in content.splitlines()),
+            )
+        self.assertEqual(len(parsed_lengths), 256)
+        self.assertLessEqual(max(parsed_lengths), 8192)
+
+        value = realistic_secret_value()
+        expressions = (
+            'page.get("cursor", ' + 'nested(' * 128 + repr(value) + ')' * 128 + ')',
+            'page.get("cursor", ' + 'current + ' * 4096 + repr(value) + ')',
+            'page.get("cursor", ' + repr(value),
+        )
+        for expression in expressions:
+            patch = patch_header + "+to" + "ken = " + expression + "\n"
+            with self.assertRaisesRegex(SystemExit, "secret-like content"):
+                self.helper["validate_review_patch"]("local diff", ["reader.py"], patch)
+
+    def test_python_mapping_assignment_tuple_suffix_is_scanned(self) -> None:
+        value = realistic_secret_value()
+        for expression in (
+            f'retained["result"]["cursor"], {value!r}',
+            f'current, {value!r}',
+            f'page.get("cursor"), {{"field": {value!r}}}',
+        ):
+            for sign in ("+", "-", " "):
+                patch = "diff --git a/reader.py b/reader.py\n--- a/reader.py\n+++ b/reader.py\n@@ -1 +1 @@\n"
+                patch += sign + "to" + "ken = " + expression + "\n"
+                with self.assertRaisesRegex(SystemExit, "secret-like content"):
+                    self.helper["validate_review_patch"]("local diff", ["reader.py"], patch)
+
+    def assert_python_cli_secret_refused(self, content: str, phase: str) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            path = repo / "reader.py"
+            path.write_text(content if phase in {"removed", "context"} else "# baseline\n", encoding="utf-8")
+            git(repo, "add", path.name)
+            git(repo, "commit", "-q", "-m", "baseline")
+            if phase == "untracked":
+                path = repo / "added.py"
+            path.write_text(
+                "# replacement\n" if phase == "removed" else content + ("# changed\n" if phase == "context" else ""),
+                encoding="utf-8",
+            )
+            if phase != "untracked":
+                git(repo, "add", path.name)
+            # A scanner failure must precede reviewer resolution. A missing
+            # external executable prevents any model call if this test goes red.
+            env = {key: os.environ[key] for key in (
+                "PATH", "SystemRoot", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP",
+            ) if key in os.environ}
+            env.update(HOME=str(root), USERPROFILE=str(root), GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "--mode", "local", "--engine", "codex",
+                 "--codex-bin", str(root / "missing-reviewer")],
+                cwd=repo, env=env, text=True, encoding="utf-8", capture_output=True, timeout=30,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("secret-like content", result.stderr)
+            self.assertNotIn("bundle:", result.stdout)
+
+    def test_python_mapping_cli_rejects_credential_selectors(self) -> None:
+        value = realistic_secret_value()
+        github = "gh" + "p_" + value
+        stripe = "sk_" + "live_" + value
+        escaped = '"' + "".join("\\x" + format(ord(char), "02x") for char in github) + '"'
+        cases = (
+            ("raw recognized selector", f"cache[{github!r}]", "untracked"),
+            ("decoded recognized selector", f"cache[{escaped}]", "untracked"),
+            ("underscore credential selector", f"page.get({stripe!r})", "staged"),
+            ("removed decoded dictionary key", "{" + escaped + ": current}", "removed"),
+            ("context decoded get selector", f"page.get({escaped})", "context"),
+        )
+        for label, expression, phase in cases:
+            with self.subTest(case=label, phase=phase):
+                self.assert_python_cli_secret_refused("to" + "ken = " + expression + "\n", phase)
+
+    def test_python_mapping_cli_rejects_credential_comments(self) -> None:
+        value = realistic_secret_value()
+        field = "to" + "ken"
+        cases = (
+            (f'{field} = retained["cursor"] # previous {field}: {value}\n', "untracked"),
+            (f'{field} = retained["cursor"] # {value}\n', "staged"),
+            (f'value = retained["cursor"] # previous {field}: {value}\n', "removed"),
+            (f'{field} = cache[\n    "cursor" # previous {field}: {value}\n]\n', "context"),
+            (f'# previous {field}: {value}\n', "untracked"),
+        )
+        for index, (content, phase) in enumerate(cases):
+            with self.subTest(case=index, phase=phase):
+                self.assert_python_cli_secret_refused(content, phase)
+
+    def test_python_mapping_cli_rejects_computed_literal_values(self) -> None:
+        prefix = repr("sk_") + " + " + repr("live_")
+        computed = prefix + ' + "a" * 24'
+        cases = (
+            ('{"key": ' + computed + '}', "untracked"),
+            ('page.get("cursor", ' + computed + ')', "staged"),
+            ('{"key": "a" * 32}', "removed"),
+            ('retained["cursor"] + ("a" * 32)', "context"),
+            ('{"key": f"a{current}b"}', "untracked"),
+        )
+        for index, (expression, phase) in enumerate(cases):
+            with self.subTest(case=index, phase=phase):
+                self.assert_python_cli_secret_refused("to" + "ken = " + expression + "\n", phase)
+
+    def test_python_mapping_cli_rejects_comments_after_delimiters(self) -> None:
+        value = realistic_secret_value()
+        field = "to" + "ken"
+        cases = (
+            (f'{field} = retained["cursor"]; # {value}\n', "untracked"),
+            (f'consume({field}=retained["cursor"]) # {value}\n', "staged"),
+            (f'headers = {{{field!r}: retained["cursor"]}} # {value}\n', "removed"),
+            (f'headers = {{{field!r}: retained["cursor"], # {value}\n}}\n', "context"),
+        )
+        for index, (content, phase) in enumerate(cases):
+            with self.subTest(case=index, phase=phase):
+                self.assert_python_cli_secret_refused(content, phase)
+
+    def test_python_mapping_cli_rejects_decoded_uri_constants(self) -> None:
+        uri = "https://" + "u:p" + "@example.com"
+        encoded = '"' + "".join("\\x" + format(ord(char), "02x") for char in uri) + '"'
+        cases = (
+            ('{"endpoint": ' + encoded + '}', "untracked"),
+            ('page.get("cursor", ' + encoded + ')', "staged"),
+            ('{' + encoded + ': current}', "removed"),
+            ('retained[' + encoded + ']', "context"),
+        )
+        for index, (expression, phase) in enumerate(cases):
+            with self.subTest(case=index, phase=phase):
+                self.assert_python_cli_secret_refused("to" + "ken = " + expression + "\n", phase)
+
+    def test_python_reference_cli_rejects_literal_call_constructions(self) -> None:
+        value = realistic_secret_value()
+        chunks = ["sk_", "live_"] + [value[index:index + 4] for index in range(0, len(value), 4)]
+        arguments = ", ".join(repr(chunk) for chunk in chunks)
+        public_prompt = json.dumps("Password: ")
+        public_scope = json.dumps("https://example.com/.default")
+        unapproved_prompt = json.dumps("correct horse battery staple")
+        cases = (
+            (f"concat({arguments})", "untracked"),
+            (f"resolve(concat({arguments}))", "staged"),
+            (f"concat([{arguments}])", "removed"),
+            (f"concat({{'parts': [{arguments}]}})", "context"),
+            (f"concat(prefix={chunks[0]!r}, suffix=[{arguments}])", "untracked"),
+            (f"concat(*[{arguments}])", "staged"),
+            (f"concat(**{{'parts': [{arguments}]}})", "removed"),
+            (f'page.get("cursor", concat({arguments}))', "context"),
+            (f"getpass.getpass(concat({arguments}))", "untracked"),
+            (f"prompt(concat({arguments}))", "staged"),
+            (f"getpass.getpass(prompt=concat({arguments}))", "removed"),
+            (f'getpass.getpass(prompt=concat({arguments})) or settings.get("password")', "staged"),
+            ('getpass.getpass(prompt="Pass" + "word: ") or settings.get("password")', "untracked"),
+            (f'getpass.getpass(prompt={public_prompt}) or settings.get("password", concat({arguments}))', "removed"),
+            (f'getpass.getpass(prompt={public_prompt}) or settings.get("password", {value!r})', "context"),
+            (f'credential.get_token({public_scope}) or cache.get("access_token", '
+             + repr(value) + ')', "staged"),
+            (f'getpass.getpass(prompt={unapproved_prompt}) or settings.get("password")', "untracked"),
+            (f'getpass.getpass(stream=sys.stderr, prompt={unapproved_prompt}) or settings.get("password")', "staged"),
+            (f'getpass.getpass(stream={value!r}, prompt={public_prompt}) or settings.get("password")', "context"),
+        )
+        for index, (expression, phase) in enumerate(cases):
+            with self.subTest(case=index, phase=phase):
+                self.assert_python_cli_secret_refused("to" + "ken = " + expression + "\n", phase)
+
+    def test_python_reference_cli_rejects_literal_container_fragments(self) -> None:
+        # The public CLI must reject fragments even when no single string
+        # satisfies the scalar credential-length threshold.
+        fragments = ["sk_", "live_"] + ["abcd", "efgh", "ijkl", "mnop", "qrst", "uvwx"]
+        values = ", ".join(repr(fragment) for fragment in fragments)
+        cases = (
+            ("[" + values + "]", "untracked"),
+            ("(" + values + ")", "staged"),
+            ("{" + values + "}", "removed"),
+            ('{"parts": [' + values + "]}", "context"),
+            ('{"first": "sk_", "second": "live_", "remaining": current}', "untracked"),
+            ('current if ready else ["sk_", "live_", value]', "staged"),
+        )
+        for expression, phase in cases:
+            with self.subTest(phase=phase, expression=expression):
+                self.assert_python_cli_secret_refused("to" + "ken = " + expression + "\n", phase)
+
+    def test_python_reference_cli_rejects_encoded_numeric_data(self) -> None:
+        values = '115, 107, 95, 108, 105, 118, 101, 95, 97, 98, 99, 100, 101, 102'
+        cases = (
+            ('bytes([' + values + '])', 'untracked'),
+            ('bytearray((' + values + '))', 'staged'),
+            ('resolve(bytes([' + values + ']))', 'removed'),
+            ('constructor(data=[' + values + '])', 'context'),
+            ('chr(115)', 'untracked'),
+            ('chr(100 + 15)', 'staged'),
+            ('[' + values + ']', 'removed'),
+            ('{"parts": (' + values + ')}', 'context'),
+        )
+        for expression, phase in cases:
+            with self.subTest(phase=phase, expression=expression):
+                self.assert_python_cli_secret_refused('to' + 'ken = ' + expression + '\n', phase)
+
+    def test_python_reference_cli_rejects_numeric_dictionary_keys(self) -> None:
+        cases = (
+            ('{115: current, 107: retained}', 'untracked'),
+            ('{"parts": {95: current, 108: retained}}', 'staged'),
+            ('{1.5: current}', 'removed'),
+            ('{True: current}', 'context'),
+        )
+        for expression, phase in cases:
+            with self.subTest(phase=phase, expression=expression):
+                self.assert_python_cli_secret_refused('to' + 'ken = ' + expression + '\n', phase)
+
+    def test_python_reference_cli_rejects_iterable_dictionary_key_fragments(self) -> None:
+        fragments = ["sk_", "live_", "abcdefgh", "ijklmnop", "qrstuvwx"]
+        fields = ", ".join(repr(fragment) + ": current" for fragment in fragments)
+        encoded = ", ".join('"' + "".join("\\x" + format(ord(char), "02x") for char in fragment)
+                            + '": current' for fragment in fragments)
+        dictionary = "{" + fields + "}"
+        cases = (
+            (dictionary, "untracked"),
+            ('{"parts": ' + dictionary + '}', "staged"),
+            ('[' + dictionary + ']', "removed"),
+            ('(' + dictionary + ',)', "context"),
+            ('{**' + dictionary + '}', "untracked"),
+            ('{' + encoded + '}', "context"),
+        )
+        for expression, phase in cases:
+            with self.subTest(phase=phase):
+                content = "to" + "ken = " + expression + "\nseparator = str()\npass" + "word = separator.join(token)\n"
+                self.assert_python_cli_secret_refused(content, phase)
+
+    def test_python_source_literal_boundaries_public_bundles(self) -> None:
+        reference = 'token = {"nextSyncToken": retained["cursor"]}\n'
+        lookup = 'password = getpass.getpass("Password: ") or settings.get("password")\n'
+        pair = "parts = (\n    " + repr(reference) + ",\n    " + repr(lookup) + ",\n)\n"
+        contents = (
+            pair,
+            'é = "café"\n' + pair,
+            "payload = " + "'" * 3 + reference + lookup + "'" * 3 + "\n",
+            'payload = r"""' + reference + lookup + '"""\n',
+        )
+        for content in contents:
+            with self.subTest(content=content), tempfile.TemporaryDirectory() as tempdir:
+                repo = init_repo(Path(tempdir))
+                path = repo / "reader.py"
+                reference_line = next(line for line in content.splitlines() if "nextSyncToken" in line)
+                path.write_text(content, encoding="utf-8")
+                bundle, truncated = self.helper["local_bundle"](repo)
+                records = re.findall(r"^source-line [0-9]+: (.+)$", bundle, re.MULTILINE)
+                self.assertEqual("".join(map(json.loads, records)), path.read_bytes().decode("utf-8"))
+                self.assertFalse(truncated)
+                git(repo, "add", path.name)
+                snapshots = [self.helper["local_bundle"](repo)]
+                git(repo, "commit", "-q", "-m", "literal fixture")
+                path.write_text("# replacement\n", encoding="utf-8")
+                snapshots.append(self.helper["local_bundle"](repo))
+                path.write_text(content + "# changed\n", encoding="utf-8")
+                git(repo, "add", path.name)
+                snapshots.append(self.helper["local_bundle"](repo))
+                for bundle, truncated in snapshots:
+                    self.assertIn(reference_line, bundle)
+                    self.assertFalse(truncated)
+
+    def test_python_source_literals_keep_credential_data_public_cli(self) -> None:
+        value = realistic_secret_value()
+        reference = 'token = {"nextSyncToken": retained["cursor"]}\n'
+        assigned = 'password = ' + repr(value) + "\n"
+        encoded = 'password = "' + "".join("\\x" + format(ord(char), "02x") for char in value) + '"\n'
+        unicode_encoded = 'password = "' + "".join("\\u" + format(ord(char), "04x") for char in value) + '"\n'
+        uri = 'token = "https://u:p@example.com"\n'
+        nested = assigned
+        for _ in range(9):
+            nested = "payload = " + repr(nested) + "\n"
+        cases = (
+            ("payload = " + repr(reference + assigned) + "\n", "untracked"),
+            ("payload = " + repr(reference + encoded) + "\n", "staged"),
+            ("payload = " + "'" * 3 + reference + assigned + "'" * 3 + "\n", "removed"),
+            ('é = "café"\npayload = ' + repr(reference + assigned) + "\n", "context"),
+            ("payload = " + repr(reference + uri) + "\n", "untracked"),
+            ("payload = " + repr(reference) + "\n" + assigned, "staged"),
+            ("payload = '" + reference + assigned, "removed"),
+            ("payload = " + repr(reference + " " * 8192 + assigned) + "\n", "context"),
+            ("payload = " + repr(reference + unicode_encoded) + "\n", "staged"),
+            ("payload = f" + repr(assigned) + "\n", "untracked"),
+            ("payload = b" + repr(assigned) + "\n", "removed"),
+            (nested, "context"),
+            ('token = arbitrary("abcd", current)\n', "untracked"),
+            ('token = retained["cursor"] # password: ' + value + "\n", "staged"),
+            ('token = retained["cursor"] or ' + repr(value) + "\n", "removed"),
+            ('token = retained["cursor"], ' + repr(value) + "\n", "context"),
+        )
+        for content, phase in cases:
+            with self.subTest(phase=phase):
+                self.assert_python_cli_secret_refused(content, phase)
+
+    def test_python_reference_cli_accepts_references_and_lookup_selectors(self) -> None:
+        credential_field = "credential"
+        public_prompt = json.dumps("Password: ")
+        public_scope = json.dumps("https://example.com/.default")
+        contents = (
+            f'{credential_field} = os.getenv("OPENAI_API_KEY", "")\n',
+            f'{credential_field} = os.environ.get("OPENAI_API_KEY", "")\n',
+            f'{credential_field} = os.environ.pop("OPENAI_API_KEY", "")\n',
+            'to' + 'ken = response.get("access_token")\n',
+            'to' + 'ken = headers.get("Authorization")\n',
+            'to' + 'ken = retained["result"]["cursor"]\n',
+            'to' + 'ken = retained[0][1]\n',
+            'to' + 'ken = resolve(retained[0], None)\n',
+            'to' + 'ken = {"parts": [current, retained[0]]}\n',
+            'to' + 'ken = {"route": current, "value": retained[0], "parts": [state.cursor, retained[1]]}\n',
+            'to' + 'ken = {"parts": [{"route": current}, {"value": retained["result"]["cursor"]}]}\n',
+            'to' + 'ken = {"nextPageToken": current, "nextSyncToken": retained["cursor"]}\n',
+            'to' + 'ken = page.get("nextPageToken", current)\n',
+            'to' + 'ken = resolve(page.get("nextPageToken", fallback.get("cursor", "")))\n',
+            'to' + 'ken = resolve([current, state.cursor], fallback=current)\n',
+            'pass' + f'word = getpass.getpass(\n    {public_prompt},\n)\n',
+            'pass' + f'word = getpass.getpass(prompt={public_prompt})\n',
+            'pass' + f'word = getpass.getpass(prompt={public_prompt}) or settings.get("password")\n',
+            'pass' + f'word = getpass.getpass(stream=sys.stderr, prompt={public_prompt}) or settings.get("password")\n',
+            'pass' + f'word = getpass.getpass({public_prompt}, stream=sys.stderr) or settings.get("password")\n',
+            'pass' + f'word = settings.get("password") or getpass.getpass({public_prompt})\n',
+            'pass' + f'word = resolve(getpass.getpass(prompt={public_prompt}) or settings.get("password"))\n',
+            'values = {"pass' + f'word": getpass.getpass(prompt={public_prompt})}}\n',
+            'pass' + f'word = getpass.getpass({public_prompt}) if ready else settings["password"]\n',
+            'to' + f'ken = credential.get_token({public_scope}) or cache["access_token"]\n',
+            'pass' + f'word = \u03b4.current or getpass.getpass(prompt={public_prompt}) or settings.get("password")\n',
+        )
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            path = repo / "reader.py"
+            path.write_text("# baseline\n", encoding="utf-8")
+            git(repo, "add", path.name)
+            git(repo, "commit", "-q", "-m", "baseline")
+            env = {key: os.environ[key] for key in (
+                "PATH", "SystemRoot", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP",
+            ) if key in os.environ}
+            env.update(HOME=str(root), USERPROFILE=str(root), GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+            for index, content in enumerate(contents):
+                with self.subTest(case=index):
+                    path.write_text(content, encoding="utf-8")
+                    git(repo, "add", path.name)
+                    result = subprocess.run(
+                        [sys.executable, str(SCRIPT), "--mode", "local", "--engine", "codex",
+                         "--codex-bin", str(root / "missing-reviewer")],
+                        cwd=repo, env=env, text=True, encoding="utf-8", capture_output=True, timeout=30,
+                    )
+                    # Reach the real bundle scanner, then stop before a reviewer.
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("executable not found", result.stderr)
+                    self.assertIn("bundle:", result.stdout)
+                    self.assertNotIn("secret-like content", result.stderr)
 
     def test_untracked_token_source_paths_remain_reviewable(self) -> None:
         for rel in (
