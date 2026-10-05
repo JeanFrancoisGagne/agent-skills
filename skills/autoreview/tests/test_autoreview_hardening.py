@@ -67,6 +67,235 @@ class AutoreviewHardeningTests(unittest.TestCase):
     def setUp(self) -> None:
         self.helper = load_helper()
 
+    def source_reference_cli_fixture(self, repo: Path, relative: str, content: str, phase: str) -> list[str]:
+        path = repo / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        original = content if phase in {"dataset", "removed", "context"} else "// baseline\n"
+        path.write_text(original, encoding="utf-8")
+        git(repo, "add", relative)
+        git(repo, "commit", "-q", "-m", "baseline")
+        if phase == "dataset":
+            (repo / "change.txt").write_text("changed\n", encoding="utf-8")
+            return ["--dataset", relative]
+        path.write_text("// replacement\n" if phase == "removed" else content + "\n", encoding="utf-8")
+        git(repo, "add", relative)
+        return []
+
+    def source_reference_cli_environment(self, root: Path) -> dict[str, str]:
+        env = {key: os.environ[key] for key in (
+            "PATH", "SystemRoot", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP",
+        ) if key in os.environ}
+        env.update(HOME=str(root), USERPROFILE=str(root),
+                   GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+        return env
+
+    def assert_source_reference_public_cli(
+        self, relative: str, content: str, *, refused: bool, phase: str = "dataset",
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            extra = self.source_reference_cli_fixture(repo, relative, content, phase)
+            argv = [sys.executable, str(SCRIPT), "--mode", "local", "--engine", "codex",
+                    "--codex-bin", str(root / "missing-reviewer"), *extra]
+            # Run the real CLI and scanner. A missing external binary stops an
+            # accepted source before any reviewer or provider can execute.
+            result = subprocess.run(argv, cwd=repo, env=self.source_reference_cli_environment(root),
+                                    text=True, encoding="utf-8", capture_output=True, timeout=30)
+            self.assertNotEqual(result.returncode, 0)
+            if refused:
+                self.assertIn("secret-like content", result.stderr)
+                self.assertNotIn("bundle:", result.stdout)
+            else:
+                self.assertIn("executable not found", result.stderr)
+                self.assertIn("bundle:", result.stdout)
+                self.assertNotIn("secret-like content", result.stderr)
+
+    def test_python_keyword_values_public_cli_context_only(self) -> None:
+        source = "configure(\n    allow_credentials=True,\n    methods=names,\n)\n"
+        self.assert_source_reference_public_cli("reader.py", source, refused=False, phase="context")
+
+    def test_python_keyword_context_keeps_adjacent_credential_refusal(self) -> None:
+        value = realistic_secret_value()
+        source = f"configure(\n    allow_credentials=True,\n    token={value!r},\n)\n"
+        self.assert_source_reference_public_cli("reader.py", source, refused=True, phase="context")
+
+    def test_python_keyword_values_public_cli(self) -> None:
+        sources = (
+            "configure(\n    allow_credentials=True,\n    methods=names,\n)\n",
+            "configure(allow_credentials=False, methods=names)\n",
+            "configure(token=current, timeout=duration)\n",
+            "é = configure(\n    token=retained[0],\n    timeout=duration,\n)\n",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assert_source_reference_public_cli("reader.py", source, refused=False)
+
+    def test_python_keyword_values_public_cli_history(self) -> None:
+        source = "configure(\n    allow_credentials=True,\n    methods=names,\n)\n"
+        for phase in ("staged", "removed", "context"):
+            with self.subTest(phase=phase):
+                self.assert_source_reference_public_cli("reader.py", source, refused=False, phase=phase)
+
+    def test_python_keyword_values_public_cli_keep_tuple_and_literal_refusals(self) -> None:
+        value = realistic_secret_value()
+        sources = (
+            f"token = current, {value!r}\n",
+            'configure(token=("sk_", "live_", current), timeout=duration)\n',
+            f"configure(token=current, {value!r})\n",
+            f"configure(token=current, # previous token: {value}\n    timeout=duration)\n",
+        )
+        for source, phase in zip(sources, ("dataset", "staged", "removed", "context")):
+            with self.subTest(phase=phase):
+                self.assert_source_reference_public_cli("reader.py", source, refused=True, phase=phase)
+
+    def test_delimited_synthetic_fixture_public_cli(self) -> None:
+        cases = (
+            ("entry.ts", 'const config = { token: "<fixture-service-token>" };\n'),
+            ("reader.py", 'api_key = "<sample-client-api-key>"\n'),
+        )
+        for relative, source in cases:
+            with self.subTest(relative=relative):
+                self.assert_source_reference_public_cli(relative, source, refused=False)
+
+    def test_delimited_synthetic_fixture_public_cli_keeps_unknown_and_suffix_refusals(self) -> None:
+        provider = "sk-proj-" + "A" * 40
+        encoded = base64.b64encode(provider.encode()).decode()
+        numeric = ", ".join(str(ord(char)) for char in provider)
+        cases = (
+            'const config = { token: "github-token" };\n',
+            'const config = { token: "<github-token>" };\n',
+            'const config = { token: "<fixture-abcdefghijklmnopq-token>" };\n',
+            'const config = { token: "<fixture-service-password>" };\n',
+            'const config = { token: "<fixture-service-token>" + "actual-production-secret" };\n',
+            f'const config = {{ token: "<fixture-{provider}-token>" }};\n',
+            'const config = { token: "<fixture-postgres://reader:actual-password@host/db-token>" };\n',
+            f'const config = {{ token: "<fixture-service-token>" + atob("{encoded}") }};\n',
+            f'const config = {{ token: "<fixture-service-token>" + String.fromCharCode({numeric}) }};\n',
+            'const config = { token: "<fixture-service-token>-----BEGIN OPENSSH PRIVATE KEY-----" };\n',
+        )
+        for source in cases:
+            with self.subTest(source=source):
+                self.assert_source_reference_public_cli("entry.ts", source, refused=True)
+
+    def test_fixture_numeric_suffix_public_cli(self) -> None:
+        provider = "sk-proj-" + "A" * 40
+        numeric = ", ".join(str(ord(char)) for char in provider)
+        source = f'const config = {{ token: "<fixture-service-token>" + String.fromCharCode({numeric}) }};\n'
+        self.assert_source_reference_public_cli("entry.ts", source, refused=True)
+
+    def test_fixture_base64_suffix_public_cli(self) -> None:
+        provider = "sk-proj-" + "A" * 40
+        encoded = base64.b64encode(provider.encode()).decode()
+        source = f'const config = {{ token: "<fixture-service-token>" + atob("{encoded}") }};\n'
+        self.assert_source_reference_public_cli("entry.ts", source, refused=True)
+
+    def test_fixture_marker_numeric_control_public_cli(self) -> None:
+        source = 'const config = { token: "<fixture-service-token>" };\n'
+        self.assert_source_reference_public_cli("entry.ts", source, refused=False)
+
+    def test_source_reference_public_cli_type_alias(self) -> None:
+        source = "export type ProviderUsageAuthToken = _ProviderUsageAuthToken;\n"
+        for relative in ("entry.ts", "entry.tsx", "entry.mts", "entry.cts"):
+            with self.subTest(relative=relative):
+                self.assert_source_reference_public_cli(relative, source, refused=False)
+
+    def test_source_reference_public_cli_header_chain(self) -> None:
+        sources = (
+            'to' + 'ken = request.headers.get("x-api-key", "")\n',
+            'to' + 'ken = request.headers.get("authorization", "").removeprefix("Bearer ").strip()\n',
+            'to' + 'ken = (request.headers.get("authorization", "").removeprefix("Bearer ").strip()\n'
+            '    or request.headers.get("x-api-key", "") or request.cookies.get("sam_admin_token", ""))\n',
+            'to' + 'ken = headers.get("Authorization", "").removeprefix("Bearer ").strip()\n',
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assert_source_reference_public_cli("reader.py", source, refused=False)
+
+    def test_source_reference_public_cli_diff_history(self) -> None:
+        sources = (
+            ("entry.ts", "export type ProviderUsageAuthToken = _ProviderUsageAuthToken;\n"),
+            ("reader.py", 'to' + 'ken = request.headers.get("x-api-key", "").strip()\n'),
+        )
+        for relative, source in sources:
+            for phase in ("staged", "removed", "context"):
+                with self.subTest(relative=relative, phase=phase):
+                    self.assert_source_reference_public_cli(relative, source, refused=False, phase=phase)
+
+    def test_source_reference_public_cli_refuses_fake_types_and_runtime_values(self) -> None:
+        value = realistic_secret_value()
+        declaration = "export type ProviderUsageAuthToken = _ProviderUsageAuthToken;\n"
+        sources = (
+            f'type ProviderUsageAuthToken = "{value}";\n',
+            f'type ProviderUsageAuthToken = "' + ''.join('\\x' + format(ord(c), '02x') for c in value) + '";\n',
+            f'const ProviderUsageAuthToken = "{value}";\n',
+            f'type ProviderUsageAuthToken = _ProviderUsageAuthToken("{value}");\n',
+            '// ' + declaration + 'ProviderUsageAuthToken = _ProviderUsageAuthToken;\n',
+            '/*\n' + declaration + '*/\nProviderUsageAuthToken = _ProviderUsageAuthToken;\n',
+            'const note = `\n' + declaration + '`;\nProviderUsageAuthToken = _ProviderUsageAuthToken;\n',
+            declaration + f'const credential = "{value}";\n',
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assert_source_reference_public_cli("entry.ts", source, refused=True)
+        for relative in ("entry.js", "evidence.txt"):
+            with self.subTest(relative=relative):
+                self.assert_source_reference_public_cli(relative, declaration, refused=True)
+
+    def test_source_reference_public_cli_refuses_header_literals_and_receiver_data(self) -> None:
+        value = realistic_secret_value()
+        expressions = (
+            f'request.headers.get("x-api-key", "{value}").strip()',
+            f'request.headers.get("authorization", "{value}").removeprefix("Bearer ").strip()',
+            f'request.headers.get("authorization", "").removeprefix("{value}").strip()',
+            f'read("{value}").headers.get("authorization", "").removeprefix("Bearer ").strip()',
+            f'request.headers.get("authorization", "").removeprefix("Bearer ").strip() + "{value}"',
+            'request.headers.get("x-api-key", "A7f9" + "K2m4" + "Q8v6")',
+            'request.headers.get("authorization", "").removeprefix("Bearer " + current)',
+            'request.headers.get("x-api-key", "postgres://reader:actual-password@host/db")',
+            'page.get("stolen-key")',
+        )
+        for expression in expressions:
+            with self.subTest(expression=expression):
+                self.assert_source_reference_public_cli("reader.py", "to" + "ken = " + expression + "\n", refused=True)
+
+    def test_source_reference_public_cli_preserves_decoding_and_parse_bounds(self) -> None:
+        value = realistic_secret_value()
+        encoded = ''.join('\\x' + format(ord(c), '02x') for c in value)
+        sources = (
+            'to' + f'ken = request.headers.get("x-api-key", "{encoded}")\n',
+            'to' + f'ken = request.headers.get("x-api-key", b"{value}")\n',
+            'to' + f'ken = request.headers.get("x-api-key", f"{value}{{current}}")\n',
+            'to' + f'ken = request.headers.get("x-api-key", "{value}"\n',
+            'to' + f'ken = request.headers.get("x-api-key", ' + 'current + ' * 4096 + repr(value) + ')\n',
+        )
+        for source in sources:
+            with self.subTest(source=source[:80]):
+                self.assert_source_reference_public_cli("reader.py", source, refused=True)
+        wrapped = 'to' + f'ken = "{value}"'
+        for _ in range(9):
+            wrapped = "note = " + repr(wrapped)
+        self.assert_source_reference_public_cli("reader.py", wrapped + "\n", refused=True)
+
+    def test_source_reference_public_cli_keeps_global_credential_guards(self) -> None:
+        alias = "export type ProviderUsageAuthToken = _ProviderUsageAuthToken;\n"
+        values = (
+            "sk-proj-" + "A" * 40,
+            "-----BEGIN OPENSSH PRIVATE KEY-----",
+            "postgres://reader:actual-password@host/db",
+        )
+        for value in values:
+            with self.subTest(value=value[:16]):
+                self.assert_source_reference_public_cli("entry.ts", alias + f'const note = "{value}";\n', refused=True)
+        for phase in ("removed", "context"):
+            source = alias + f'const credential = "{realistic_secret_value()}";\n'
+            self.assert_source_reference_public_cli("entry.ts", source, refused=True, phase=phase)
+
+    def test_source_reference_public_cli_keeps_unknown_mock_literal_refusal(self) -> None:
+        source = ('import { it, vi } from "vitest";\n'
+                  'it("auth", () => { vi.fn().mockResolvedValue({ apiKey: "github-token" }); });\n')
+        self.assert_source_reference_public_cli("request-auth.test.ts", source, refused=True)
+
     def test_powershell_harness_exposes_runnable_engines_only(self) -> None:
         harness = SCRIPT.with_name("test-review-harness.ps1").read_text(encoding="utf-8")
 
@@ -3800,6 +4029,49 @@ class AutoreviewHardeningTests(unittest.TestCase):
         ):
             with self.subTest(content=content):
                 self.assertFalse(self.helper["secret_text_risk"](content))
+
+    def test_public_branch_bundle_retains_normalized_mock_credential_history(self) -> None:
+        old = ('import { it, vi } from "vitest";\n'
+               'it("request auth", () => {\n'
+               '  const requestAuth = vi.fn().mockResolvedValue({\n'
+               '    ok: true, apiKey: "github-token", headers: {},\n'
+               '  });\n'
+               '});\n')
+        new = old.replace('"github-token"', '"fixture-api-key"')
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            path = repo / 'request-auth.test.ts'
+            path.write_bytes(old.encode('utf-8'))
+            git(repo, 'add', path.name)
+            git(repo, 'commit', '-q', '-m', 'original mock')
+            base = git(repo, 'rev-parse', 'HEAD').strip()
+            path.write_bytes(new.encode('utf-8'))
+            git(repo, 'add', path.name)
+            git(repo, 'commit', '-q', '-m', 'normalize mock')
+            bundle, truncated = self.helper['branch_bundle'](repo, base)
+            self.assertIn('-    ok: true, apiKey: "github-token", headers: {},', bundle)
+            self.assertIn('+    ok: true, apiKey: "fixture-api-key", headers: {},', bundle)
+            self.assertFalse(truncated)
+
+    def test_public_branch_bundle_refuses_removed_literal_credentials(self) -> None:
+        values = ('stolen-token', realistic_secret_value())
+        for value in values:
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as tempdir:
+                repo = init_repo(Path(tempdir))
+                path = repo / 'request-auth.test.ts'
+                old = ('import { it, vi } from "vitest";\n'
+                       'it("request auth", () => {\n'
+                       f'  const requestAuth = vi.fn().mockResolvedValue({{ apiKey: "{value}" }});\n'
+                       '});\n')
+                path.write_bytes(old.encode('utf-8'))
+                git(repo, 'add', path.name)
+                git(repo, 'commit', '-q', '-m', 'literal baseline')
+                base = git(repo, 'rev-parse', 'HEAD').strip()
+                path.write_bytes(old.replace(value, 'fixture-api-key').encode('utf-8'))
+                git(repo, 'add', path.name)
+                git(repo, 'commit', '-q', '-m', 'normalize literal')
+                with self.assertRaisesRegex(SystemExit, 'secret-like content'):
+                    self.helper['branch_bundle'](repo, base)
 
     def test_public_bundle_accepts_declared_javascript_credential_references(self) -> None:
         sources = (

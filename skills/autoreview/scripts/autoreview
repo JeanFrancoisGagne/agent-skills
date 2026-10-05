@@ -3938,20 +3938,45 @@ def secret_literal_risk(
     return False
 
 
+def javascript_numeric_fallback_risk(expression: str, dialect: str | None) -> bool:
+    if dialect is None:
+        return False
+    # Credential continuations may assemble numeric bytes without any quoted
+    # literal. Reuse the initializer classifier after masking noncode; ordinary
+    # call options and sibling assignments keep their existing owners.
+    code = javascript_binding_code(expression)
+    return (
+        re.match(r"\s*(?:\|\||&&|\?\?|[+?])", code) is not None
+        and javascript_expression_has_literal(code)
+    )
+
+
 def fallback_secret_risk(
     text: str,
     minimum_length: int = 8,
     *,
     javascript_dialect: str | None = None,
 ) -> bool:
-    return secret_literal_risk(
-        fallback_expression(
-            text,
-            typescript=javascript_dialect == "typescript",
+    expression = fallback_expression(text, typescript=javascript_dialect == "typescript")
+    return any((
+        secret_literal_risk(
+            expression,
+            minimum_length=minimum_length,
+            javascript_dialect=javascript_dialect,
         ),
-        minimum_length=minimum_length,
-        javascript_dialect=javascript_dialect,
+        javascript_numeric_fallback_risk(expression, javascript_dialect),
+    ))
+
+
+def delimited_synthetic_secret_fixture(value: str, normalized_key: str) -> bool:
+    # Explicit markers bind an existing fixture prefix to this credential
+    # field. One short alphabetic role is a label, not opaque credential data.
+    # Unknown labels, suffixes and credential constructions keep their scans.
+    marker = re.fullmatch(
+        r"<(?P<prefix>[a-z]+)-(?:[a-z]{1,16}-)?" + re.escape(normalized_key) + r">",
+        value,
     )
+    return marker is not None and marker.group("prefix") in SYNTHETIC_SECRET_PREFIXES
 
 
 def synthetic_secret_fixture(value: str, key: str) -> bool:
@@ -3970,10 +3995,11 @@ def synthetic_secret_fixture(value: str, key: str) -> bool:
         "-",
         camel_split_key.casefold(),
     ).strip("-")
-    return any(
-        normalized == f"{prefix}-{normalized_key}"
-        for prefix in SYNTHETIC_SECRET_PREFIXES
-    )
+    return any((
+        any(normalized == f"{prefix}-{normalized_key}"
+            for prefix in SYNTHETIC_SECRET_PREFIXES),
+        delimited_synthetic_secret_fixture(value, normalized_key),
+    ))
 
 
 def safe_secret_assignment_suffix(
@@ -5110,6 +5136,25 @@ def javascript_binding_code(text: str) -> str:
     return "".join(masked)
 
 
+def typescript_type_reference_ranges(text: str, dialect: str | None) -> tuple[tuple[int, int], ...]:
+    if dialect != "typescript":
+        return ()
+    # Only a complete type-name alias has no runtime value. Compare raw code so
+    # comments, strings and templates cannot establish a declaration exemption.
+    identifier = r"[A-Za-z_$][A-Za-z0-9_$]*"
+    declaration = re.compile(
+        r"(?m)^[ \t]*(?:export[ \t]+)?type[ \t]+"
+        r"(?P<assignment>" + identifier + r"[ \t]*=[ \t]*)"
+        + identifier + r"(?:\." + identifier + r")*;[ \t]*\r?$"
+    )
+    code = javascript_binding_code(text)
+    return tuple(
+        match.span("assignment") for match in declaration.finditer(text)
+        if match.end() - match.start() <= 8192
+        and code[match.start() : match.end()] == match.group()
+    )
+
+
 def declared_javascript_secret_reference(text: str, start: int, value: str) -> bool:
     reference = re.fullmatch(URI_CREDENTIAL_REFERENCE_TEXT, value)
     if reference is None:
@@ -5733,6 +5778,50 @@ def python_call_computed_reference(raw: str, target: str, argument: ast.expr) ->
     return not call_arguments_risk(raw, target)
 
 
+def python_header_lookup_receiver(part: ast.AST) -> bool:
+    if not isinstance(part, ast.Call) or not python_mapping_call(part):
+        return False
+    receiver = part.func.value
+    if isinstance(receiver, ast.Attribute):
+        return receiver.attr == "headers"
+    return isinstance(receiver, ast.Name) and receiver.id == "headers"
+
+
+def python_hyphenated_header_selector(value: object) -> bool:
+    if not isinstance(value, str) or "-" not in value:
+        return False
+    if secret_literal_risk(value) or uri_userinfo_literal_risk(value):
+        return False
+    # A hyphenated header name locates a value. Keep the existing selector
+    # length and decoded-credential checks before removing field separators.
+    return python_mapping_selector(value.replace("-", ""))
+
+
+def python_header_field_selector(part: ast.Call, index: int, argument: ast.expr) -> bool:
+    if index != 0 or not python_header_lookup_receiver(part):
+        return False
+    if not isinstance(argument, ast.Constant):
+        return False
+    return python_hyphenated_header_selector(argument.value)
+
+
+def python_bearer_prefix_call(part: ast.Call) -> bool:
+    return (
+        isinstance(part.func, ast.Attribute) and part.func.attr == "removeprefix"
+        and len(part.args) == 1 and not part.keywords
+    )
+
+
+def python_bearer_prefix_argument(part: ast.Call, index: int, argument: ast.expr) -> bool:
+    if index != 0 or not python_bearer_prefix_call(part):
+        return False
+    if not isinstance(argument, ast.Constant) or argument.value != "Bearer ":
+        return False
+    # This is a public authentication prefix, not a credential. Both walks
+    # still inspect the lookup receiver, selector and every default argument.
+    return python_header_lookup_receiver(part.func.value)
+
+
 def python_call_reference_argument(
     expression: str, part: ast.Call, index: int, argument: ast.expr,
 ) -> bool:
@@ -5742,7 +5831,11 @@ def python_call_reference_argument(
     # generic mapping-field heuristics must not override its accepted selector.
     if safe_credential_lookup_argument(target, raw, index):
         return True
-    if python_call_field_selector(part, index, argument):
+    if any((
+        python_call_field_selector(part, index, argument),
+        python_header_field_selector(part, index, argument),
+        python_bearer_prefix_argument(part, index, argument),
+    )):
         return True
     return python_call_computed_reference(raw, target, argument)
 
@@ -5891,14 +5984,16 @@ def python_sequence_reference_children(part: ast.AST):
 
 
 def python_call_reference_children(expression: str, part: ast.Call):
-    if not python_named_reference(part.func):
+    if not isinstance(part.func, (ast.Name, ast.Attribute)):
         return None
-    # Reuse the checked arguments so a public prompt stays public when another
-    # branch reads a mapping. Computed arguments never pass the constant check.
+    # Traverse every receiver and unchecked argument. Public prompt literals
+    # keep their argument contract; normalization cannot hide receiver data.
     return [(argument, False) for argument in python_call_literal_nodes(expression, part)]
 
 
 def python_reference_children(expression: str, part: ast.AST):
+    if isinstance(part, ast.Attribute):
+        return [(part.value, False)]
     if isinstance(part, ast.Subscript):
         return [(part.value, False), (part.slice, True)]
     if isinstance(part, ast.Call):
@@ -5913,6 +6008,22 @@ def python_reference_children_risk(children, inspect, depth: int) -> bool | None
     if True in risks:
         return True
     return None if None in risks else False
+
+
+def python_boolean_literal_with_comma(expression: str, node: ast.AST) -> bool:
+    if not isinstance(node, ast.Tuple):
+        return False
+    if len(node.elts) != 1:
+        return False
+    literal = node.elts[0]
+    # Hunk context can omit the call opener. A single bare boolean plus
+    # comma keeps scalar literal checks; parentheses or more data keep
+    # the strict tuple walk. No assignment or source bytes are exempted.
+    return all((
+        isinstance(literal, ast.Constant),
+        type(getattr(literal, "value", None)) is bool,
+        re.fullmatch(r"(?:True|False)[ \t\r\n]*,", expression) is not None,
+    ))
 
 
 def python_reference_risk(expression: str, node: ast.expr) -> bool | None:
@@ -5932,7 +6043,7 @@ def python_reference_risk(expression: str, node: ast.expr) -> bool | None:
 
     # Literal assignments retain field-matched fixture and literal checks.
     # This path recognizes reference expressions, never diagnostic prose.
-    if isinstance(node, ast.Constant):
+    if any((isinstance(node, ast.Constant), python_boolean_literal_with_comma(expression, node))):
         return None
     try:
         if python_call_literal_risk(expression, node):
@@ -5951,7 +6062,7 @@ def python_public_call_literals(expression: str, part: ast.Call):
             yield keyword.value
 
 
-def python_literal_source_position(expression: str, literal: ast.Constant) -> int:
+def python_literal_source_position(expression: str, literal: ast.AST) -> int:
     lines = expression.splitlines(keepends=True)
     # AST columns count UTF-8 bytes; scanner positions count characters.
     column = len(lines[literal.lineno - 1].encode("utf-8")[:literal.col_offset].decode("utf-8"))
@@ -6027,13 +6138,56 @@ def python_reviewed_literal_prefixes(text: str, contexts, depth: int) -> set[int
     return reviewed
 
 
-def python_assignment_reference_prefixes(text: str, prefix, contexts, literal_prefixes) -> set[int] | None:
+def python_statement_keyword_starts(text: str, start: int, end: int) -> set[int]:
+    source = text[start:end]
+    start += len(source) - len(source.lstrip())
+    source = source.strip()
+    if not source or len(source) > 8192:
+        return set()
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError, RecursionError):
+        return set()
+    return {
+        start + python_literal_source_position(source, part)
+        for part in ast.walk(tree) if isinstance(part, ast.keyword)
+    }
+
+
+def python_has_assignment_keyword(assignment_prefixes) -> bool:
+    return any(prefix.group().rstrip().endswith("=") for prefix in assignment_prefixes)
+
+
+def python_keyword_assignment_starts(text: str, assignment_prefixes) -> set[int]:
+    # Only complete bounded statements establish keyword commas. Unknown
+    # syntax keeps tuple scanning, including every literal after a comma.
+    if not python_has_assignment_keyword(assignment_prefixes):
+        return set()
+    offsets = [0]
+    for line in text.splitlines(keepends=True):
+        offsets.append(offsets[-1] + len(line))
+    starts: set[int] = set()
+    start = 0
+    try:
+        for token in tokenize.generate_tokens(io.StringIO(text).readline):
+            if token.type == tokenize.NEWLINE:
+                end = offsets[min(token.start[0] - 1, len(offsets) - 1)] + token.start[1]
+                starts.update(python_statement_keyword_starts(text, start, end))
+                start = end + len(token.string)
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        pass
+    return starts
+
+
+def python_assignment_reference_prefixes(text: str, prefix, contexts, literal_prefixes,
+                                         keyword_starts=()) -> set[int] | None:
     # Empty results leave unknown expressions in the raw scan. None preserves
     # an explicit risky-expression refusal at the decision owner.
     if contexts[prefix.start()] is not None or not python_assignment_in_code(text, prefix.start()):
         return set()
     parsed = python_assignment_expression(
-        text, prefix.end(), mapping_entry=prefix.group().rstrip().endswith(":"),
+        text, prefix.end(), mapping_entry=any((prefix.group().rstrip().endswith(":"),
+                           prefix.start() in keyword_starts)),
     )
     if parsed is None:
         return set()
@@ -6056,8 +6210,9 @@ def python_source_reference_preflight(text: str, assignment_prefixes, depth: int
     if references is None:
         return None
     literal_prefixes = python_literal_prefix_index(contexts)
+    keyword_starts = python_keyword_assignment_starts(text, assignment_prefixes)
     for prefix in assignment_prefixes:
-        assignment = python_assignment_reference_prefixes(text, prefix, contexts, literal_prefixes)
+        assignment = python_assignment_reference_prefixes(text, prefix, contexts, literal_prefixes, keyword_starts)
         if assignment is None:
             return None
         references.update(assignment)
@@ -6095,6 +6250,7 @@ def secret_text_risk(
         text,
         uri_authorities,
     )
+    safe_assignment_ranges += typescript_type_reference_ranges(text, javascript_dialect)
     if compose_source:
         safe_assignment_ranges += compose_required_uri_variable_ranges(text, uri_authorities)
     if python_source:
