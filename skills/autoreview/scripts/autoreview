@@ -6232,6 +6232,18 @@ def basic_authorization_risk(text: str) -> bool:
     return False
 
 
+def shell_environment_selector_ranges(text: str) -> tuple[tuple[int, int], ...]:
+    # An anchored grep pattern with no value selects an environment field.
+    # Mask only that field, so neighbouring values keep every credential check.
+    pattern = re.compile(
+        r"""(?m)(?:^|[;&|])[ \t]*(?:/(?:[A-Za-z0-9_.-]+/)*)?grep"""
+        r"""(?:[ \t]+(?:-E|--extended-regexp))*[ \t]+(?P<quote>['"])"""
+        r"""\^(?P<name>[A-Za-z_][A-Za-z0-9_]{0,127})=(?P=quote)(?=[ \t\r\n;&|]|$)"""
+    )
+    return tuple((match.start("name"), match.end("name") + 1)
+                 for match in pattern.finditer(text))
+
+
 def secret_text_risk(
     text: str,
     *,
@@ -6250,6 +6262,7 @@ def secret_text_risk(
         text,
         uri_authorities,
     )
+    safe_assignment_ranges += shell_environment_selector_ranges(text)
     safe_assignment_ranges += typescript_type_reference_ranges(text, javascript_dialect)
     if compose_source:
         safe_assignment_ranges += compose_required_uri_variable_ranges(text, uri_authorities)

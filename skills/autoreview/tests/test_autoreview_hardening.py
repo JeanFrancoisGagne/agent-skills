@@ -111,6 +111,25 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 self.assertIn("bundle:", result.stdout)
                 self.assertNotIn("secret-like content", result.stderr)
 
+    def test_public_cli_allows_empty_anchored_environment_selectors(self) -> None:
+        sources = (
+            "grep -E '^SERVICE_TOKEN=' config.env | tr -d '\r'\n",
+            "[ -f config.env ] && grep -E '^SERVICE_TOKEN=' config.env | head -1 | tr -d '\r'\n",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assert_source_reference_public_cli("install.sh", source, refused=False)
+
+    def test_public_cli_selectors_keep_credential_value_refusals(self) -> None:
+        value = realistic_secret_value()
+        sources = (
+            f"grep -E '^SERVICE_TOKEN={value}' config.env | tr -d '\r'\n",
+            f"grep -E '^SERVICE_TOKEN=' config.env\nSERVICE_TOKEN='{value}'\n",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assert_source_reference_public_cli("install.sh", source, refused=True)
+
     def test_python_keyword_values_public_cli_context_only(self) -> None:
         source = "configure(\n    allow_credentials=True,\n    methods=names,\n)\n"
         self.assert_source_reference_public_cli("reader.py", source, refused=False, phase="context")
