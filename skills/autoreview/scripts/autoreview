@@ -3415,18 +3415,43 @@ def compose_sequence_owner(text: str, position: int, indent: int) -> str | None:
     return None
 
 
+def compose_mount_source_comment_safe(mount: re.Match[str]) -> bool:
+    # A spaced hash ends an unquoted YAML scalar. It cannot become part of
+    # a source reference even when a later brace and mount separator exist.
+    return bool(mount.group("quote")) or re.search(r"[ \t]#", mount.group("source") or "") is None
+
+
+def compose_mount_reference_shape(mount: re.Match[str]) -> bool:
+    source = mount.group("source") or ""
+    return len(source) + len(mount.group("descriptor")) <= 8192 and compose_mount_source_comment_safe(mount) and (
+        not source or compose_required_uri_reference(source) is not None
+        or re.fullmatch(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}", source) is not None
+    )
+
+
+def compose_mount_source_ranges(mount: re.Match[str]) -> tuple[tuple[int, int], ...]:
+    required = compose_required_uri_reference(mount.group("source") or "")
+    if required is None:
+        return ()
+    # A required source names an environment value. Leave its error diagnostic
+    # visible so credentials in that text cannot enter the review bundle.
+    return ((mount.start("source"), mount.start("source") + required.end("operator")),)
+
+
 def compose_mount_reference_ranges(text: str) -> tuple[tuple[int, int], ...]:
     ranges: list[tuple[int, int]] = []
     mounts = re.finditer(
         r'(?m)^(?P<indent>[ ]*)-[ \t]+(?P<quote>["\']?)'
+        r'(?P<source>\$\{[^\r\n}]*\})?'
         r'(?P<descriptor>(?:~?/|\./|\.\./)?[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*'
         r':/[A-Za-z0-9_./-]+(?::(?:ro|rw))?)(?P=quote)[ \t]*(?:#.*)?\r?$', text,
     )
     for mount in mounts:
-        if len(mount.group("descriptor")) > 8192:
+        if not compose_mount_reference_shape(mount):
             continue
         if compose_sequence_owner(text, mount.start(), len(mount.group("indent"))) != "volumes":
             continue
+        ranges.extend(compose_mount_source_ranges(mount))
         # A volumes item names filesystem references, not credential values.
         # Mask only assignment-shaped names; target paths and comments stay scanned.
         for prefix in SECRET_ASSIGNMENT_PREFIX_PATTERN.finditer(text, mount.start("descriptor"), mount.end("descriptor")):
@@ -6313,6 +6338,43 @@ def shell_environment_selector_ranges(text: str) -> tuple[tuple[int, int], ...]:
                  for match in pattern.finditer(text))
 
 
+def documentation_comment_prefix(text: str, position: int) -> str | None:
+    start = max(0, position - 8192)
+    boundary = max(text.rfind("\n", start, position), text.rfind("\r", start, position))
+    if boundary < 0 and start > 0:
+        return None
+    return text[boundary + 1 : position]
+
+
+def documentation_component_risk(component: str) -> bool:
+    # URI userinfo allows some single-class strings. A document name cannot
+    # justify publishing a long opaque value after a credential label.
+    return uri_userinfo_literal_risk(component) or len(re.sub(r"[^A-Za-z0-9]", "", component)) >= 20
+
+
+def documentation_comment_reference(text: str, prefix: re.Match[str]) -> bool:
+    before = documentation_comment_prefix(text, prefix.start())
+    if before is None or re.fullmatch(r"[ \t]*#[^\r\n]*[A-Za-z][^\r\n]*[ \t]", before) is None:
+        return False
+    suffix = text[prefix.end() : prefix.end() + 8193].partition("\n")[0]
+    reference = re.fullmatch(
+        r"(?P<path>(?:\.{1,2}/)?(?:[A-Za-z0-9_.-]+/)+"
+        r"[A-Za-z0-9_.-]+\.(?:md|rst|adoc))\.?[ \t]*\r?", suffix,
+    )
+    if len(suffix) > 8192 or reference is None:
+        return False
+    # A prose link is a file reference, not the value of the named credential.
+    # Keep opaque components, trailing content and every other comment scanned.
+    stem = reference.group("path").rsplit(".", 1)[0]
+    return not any(documentation_component_risk(part) for part in stem.split("/"))
+
+
+def documentation_comment_reference_ranges(text: str) -> tuple[tuple[int, int], ...]:
+    return tuple((prefix.start(), prefix.end())
+                 for prefix in SECRET_ASSIGNMENT_PREFIX_PATTERN.finditer(text)
+                 if documentation_comment_reference(text, prefix))
+
+
 def secret_text_risk(
     text: str,
     *,
@@ -6332,6 +6394,7 @@ def secret_text_risk(
         uri_authorities,
     )
     safe_assignment_ranges += shell_environment_selector_ranges(text)
+    safe_assignment_ranges += documentation_comment_reference_ranges(text)
     safe_assignment_ranges += typescript_type_reference_ranges(text, javascript_dialect)
     if compose_source:
         safe_assignment_ranges += compose_required_uri_variable_ranges(text, uri_authorities)

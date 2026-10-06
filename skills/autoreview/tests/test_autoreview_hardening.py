@@ -1271,12 +1271,94 @@ class AutoreviewHardeningTests(unittest.TestCase):
         source = "  - 'DATABASE_URL: postgres://reader:${DB_PASSWORD:?required}@db/data'\n"
         self.assert_source_reference_public_cli("compose.yml", source, refused=True)
 
+    def test_documentation_comment_references_public_cli(self) -> None:
+        cases = (
+            ("compose.yml", '# "is a directory". Minting a new token: deployment/onprem/homeassistant/README.md.\n', "dataset"),
+            ("compose.yml", '# "is a directory". Minting a new token: deployment/onprem/homeassistant/README.md.\n', "context"),
+            ("reader.py", "# Configuring a password: docs/security/overview.rst.\n", "dataset"),
+        )
+        for relative, content, phase in cases:
+            with self.subTest(relative=relative, phase=phase):
+                self.assert_source_reference_public_cli(relative, content, refused=False, phase=phase)
+
+    def test_documentation_comment_references_keep_credential_refusals(self) -> None:
+        value = realistic_secret_value()
+        encoded = base64.b64encode(value.encode()).decode()
+        contents = (
+            "# Setting a token: " + value + "\n",
+            '# Setting a token: "' + value + '"\n',
+            "# Setting a token: " + encoded + "\n",
+            "# Setting a token: docs/security.md. " + value + "\n",
+            "# Setting a token: docs/" + value + ".md\n",
+            "token: docs/security.md\n",
+        )
+        for content in contents:
+            with self.subTest(content=content):
+                self.assert_source_reference_public_cli("compose.yml", content, refused=True)
+
     def test_compose_indentless_mount_sequences_public_cli(self) -> None:
         items = "    - data:/data\n    - admin_password:/run/admin_password:ro\n"
         for owner, refused in (("volumes", False), ("environment", True)):
             source = "services:\n  service:\n    " + owner + ":\n" + items
             with self.subTest(owner=owner):
                 self.assert_source_reference_public_cli("compose.yml", source, refused=refused)
+
+    def test_compose_required_mount_source_public_cli(self) -> None:
+        mount = ("      - ${STATE_DIR:?STATE_DIR required - the copied state}/secrets/"
+                 "admin_token:/etc/secrets/admin_token:ro\n")
+        for phase in ("dataset", "context"):
+            with self.subTest(phase=phase):
+                self.assert_source_reference_public_cli(
+                    "compose.yml", "services:\n  service:\n    volumes:\n" + mount,
+                    refused=False, phase=phase,
+                )
+
+    def test_reference_boundaries_keep_secret_refusals(self) -> None:
+        opaque = "qjkmnpqrstuvwxyzghijklmno"
+        sources = (
+            "# Setting a token: docs/" + opaque + ".md\n",
+            "services:\n  service:\n    volumes:\n      - ${STATE_DIR:?required #}/admin_password:/" + opaque + "\n",
+            "keep: true" + " " * 8193 + "# prose token: docs/security.md\n",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assert_source_reference_public_cli("compose.yml", source, refused=True)
+
+    def test_reference_boundaries_preserve_public_references(self) -> None:
+        sources = (
+            "# Configuring a token: docs/security.md\n",
+            "services:\n  service:\n    volumes:\n      - ${STATE_DIR:?required}/secrets/admin_token:/etc/secrets/admin_token:ro\n",
+            'services:\n  service:\n    volumes:\n      - "${STATE_DIR:?required #}/secrets/admin_token:/etc/secrets/admin_token:ro"\n',
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assert_source_reference_public_cli("compose.yml", source, refused=False)
+
+    def test_documentation_punctuation_keeps_credential_refusals(self) -> None:
+        for component in ("qjkmnpqrst-uvwxyzghij", "qjkmnpqrst.uvwxyzghij"):
+            with self.subTest(component=component):
+                self.assert_source_reference_public_cli(
+                    "compose.yml", "# Setting a token: docs/" + component + ".md\n",
+                    refused=True,
+                )
+
+    def test_compose_required_mount_source_keeps_credential_refusals(self) -> None:
+        value = realistic_secret_value()
+        encoded = base64.b64encode(value.encode()).decode()
+        expressions = (
+            "${STATE_DIR:?password=" + value + "}",
+            "${STATE_DIR:?password=" + encoded + "}",
+            "${STATE_DIR:-" + value + "}",
+            "${STATE_DIR:?${OTHER_DIR}}",
+        )
+        for expression in expressions:
+            source = ("services:\n  service:\n    volumes:\n      - " + expression
+                      + "/secrets/admin_token:/etc/secrets/admin_token:ro\n")
+            with self.subTest(expression=expression):
+                self.assert_source_reference_public_cli("compose.yml", source, refused=True)
+        source = ("services:\n  service:\n    environment:\n"
+                  "      - ${STATE_DIR:?required}/secrets/admin_token:/etc/secrets/admin_token:ro\n")
+        self.assert_source_reference_public_cli("compose.yml", source, refused=True)
 
     def test_compose_mount_lookup_stops_at_outer_sequence(self) -> None:
         source = ("services:\n  service:\n    volumes:\n    - data:/data\n"
