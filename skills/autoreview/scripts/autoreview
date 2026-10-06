@@ -3365,9 +3365,12 @@ def string_contexts_at(
 def compose_uri_context(
     text: str, position: int, context: tuple[str, int] | None,
 ) -> bool:
+    # YAML scalar boundaries come from this assignment line; a shell quote in
+    # an earlier service must not become the quote owner of this URI.
+    prefix = text[bounded_line_start(text, position) + 1 : position]
     return (
-        (context is None or context[0] == '"')
-        and config_assignment_context(text, position) is not None
+        not prefix.rstrip().endswith("'")
+        and config_assignment_context(text, position, allow_environment_name=True) is not None
     )
 
 
@@ -3378,6 +3381,57 @@ def compose_required_uri_reference(value: str) -> re.Match[str] | None:
         r"\$\{(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?P<operator>:?\?)"
         r"[^${}\r\n\"'`\\@]*\}", value,
     )
+
+
+def compose_environment_reference_ranges(text: str) -> tuple[tuple[int, int], ...]:
+    ranges: list[tuple[int, int]] = []
+    assignments = re.finditer(
+        r'(?m)^[ \t]*(?P<key>[A-Za-z_][A-Za-z0-9_.-]*)[ \t]*:[ \t]*'
+        r'(?P<quote>"?)(?P<value>\$\{[^\r\n]*\})(?P=quote)[ \t]*(?:#.*)?\r?$',
+        text,
+    )
+    for assignment in assignments:
+        value = assignment.group("value")
+        if len(value) > 8192:
+            continue
+        reference = compose_required_uri_reference(value) or re.fullmatch(
+            r"\$\{[A-Za-z_][A-Za-z0-9_]*(?P<operator>:?-)\}", value,
+        )
+        if reference is not None:
+            # Only the key and reference operator are structural. Diagnostic
+            # text remains visible to every credential and decoded-value scan.
+            ranges.append((assignment.start("key"), assignment.start("value") + reference.end("operator")))
+    return tuple(ranges)
+
+
+def compose_sequence_owner(text: str, position: int, indent: int) -> str | None:
+    prefix = text[max(0, position - 8192) : position]
+    prefix = re.sub(r"(?m)^[ \t]*(?:#.*)?\r?\n", "", prefix)
+    for line in reversed(prefix.splitlines()):
+        line_indent = len(line) - len(line.lstrip(" "))
+        if line_indent < indent or (line_indent == indent and not re.match(r"-[ \t]", line.lstrip(" "))):
+            owner = re.fullmatch(r"[ ]*(?P<key>[A-Za-z_][A-Za-z0-9_.-]*):[ \t]*(?:!override[ \t]*)?(?:#.*)?", line)
+            return owner.group("key") if owner is not None else None
+    return None
+
+
+def compose_mount_reference_ranges(text: str) -> tuple[tuple[int, int], ...]:
+    ranges: list[tuple[int, int]] = []
+    mounts = re.finditer(
+        r'(?m)^(?P<indent>[ ]*)-[ \t]+(?P<quote>["\']?)'
+        r'(?P<descriptor>(?:~?/|\./|\.\./)?[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*'
+        r':/[A-Za-z0-9_./-]+(?::(?:ro|rw))?)(?P=quote)[ \t]*(?:#.*)?\r?$', text,
+    )
+    for mount in mounts:
+        if len(mount.group("descriptor")) > 8192:
+            continue
+        if compose_sequence_owner(text, mount.start(), len(mount.group("indent"))) != "volumes":
+            continue
+        # A volumes item names filesystem references, not credential values.
+        # Mask only assignment-shaped names; target paths and comments stay scanned.
+        for prefix in SECRET_ASSIGNMENT_PREFIX_PATTERN.finditer(text, mount.start("descriptor"), mount.end("descriptor")):
+            ranges.append((prefix.start(), prefix.end()))
+    return tuple(ranges)
 
 
 def compose_uri_username_reference(value: str) -> bool:
@@ -3793,13 +3847,28 @@ def format_arguments_are_references(arguments: str) -> bool:
 def config_assignment_context(
     text: str,
     position: int,
+    *,
+    allow_environment_name: bool = False,
 ) -> tuple[str, str] | None:
     line_start = bounded_line_start(text, position)
     prefix = text[line_start + 1 : position]
+    key_pattern = r"(?:[A-Za-z_][A-Za-z0-9_.-]*)?(?:dsn|uri|url)"
+    key_quotes = r'["\']?'
+    closing_key_quote = key_quotes
+    value_quote = key_quotes
+    if allow_environment_name:
+        # Compose environment keys can describe URIs without a URL suffix.
+        # The caller still requires a complete protected credential reference.
+        key_pattern = rf"(?:{key_pattern}|(?-i:[A-Z_][A-Z0-9_]*))"
+        # A quote around the whole command is not a quoted mapping key.
+        # Match key delimiters and allow only interpolating value quotes.
+        key_quotes = r'(?P<key_quote>["\']?)'
+        closing_key_quote = r'(?P=key_quote)'
+        value_quote = r'"?'
     match = re.fullmatch(
-        r"\s*(?P<comment>#\s*)?(?:-\s+)?[\"']?"
-        r"(?P<key>(?:[A-Za-z_][A-Za-z0-9_.-]*)?(?:dsn|uri|url))"
-        r"[\"']?\s*(?P<separator>[:=])\s*[\"']?",
+        rf"\s*(?P<comment>#\s*)?(?:-\s+)?{key_quotes}"
+        rf"(?P<key>{key_pattern})"
+        rf"{closing_key_quote}\s*(?P<separator>[:=])\s*{value_quote}",
         prefix,
         re.IGNORECASE,
     )
@@ -6266,6 +6335,8 @@ def secret_text_risk(
     safe_assignment_ranges += typescript_type_reference_ranges(text, javascript_dialect)
     if compose_source:
         safe_assignment_ranges += compose_required_uri_variable_ranges(text, uri_authorities)
+        safe_assignment_ranges += compose_environment_reference_ranges(text)
+        safe_assignment_ranges += compose_mount_reference_ranges(text)
     if python_source:
         safe_assignment_ranges += python_control_reference_ranges(text)
     assignment_scan_text = mask_ranges(text, safe_assignment_ranges)

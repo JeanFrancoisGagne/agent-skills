@@ -1267,6 +1267,64 @@ class AutoreviewHardeningTests(unittest.TestCase):
             with self.subTest(paths=paths), self.assertRaisesRegex(SystemExit, "secret-like content"):
                 self.helper["validate_review_patch"]("local diff", paths, patch)
 
+    def test_compose_same_line_single_quotes_remain_literal(self) -> None:
+        source = "  - 'DATABASE_URL: postgres://reader:${DB_PASSWORD:?required}@db/data'\n"
+        self.assert_source_reference_public_cli("compose.yml", source, refused=True)
+
+    def test_compose_indentless_mount_sequences_public_cli(self) -> None:
+        items = "    - data:/data\n    - admin_password:/run/admin_password:ro\n"
+        for owner, refused in (("volumes", False), ("environment", True)):
+            source = "services:\n  service:\n    " + owner + ":\n" + items
+            with self.subTest(owner=owner):
+                self.assert_source_reference_public_cli("compose.yml", source, refused=refused)
+
+    def test_compose_mount_lookup_stops_at_outer_sequence(self) -> None:
+        source = ("services:\n  service:\n    volumes:\n    - data:/data\n"
+                  "    - environment:\n      - admin_password:/run/admin_password:ro\n")
+        self.assert_source_reference_public_cli("compose.yml", source, refused=True)
+
+    def test_compose_mount_references_public_cli(self) -> None:
+        mount = "      - ~/.state/secrets/admin_password:/etc/secrets/admin_password:ro\n"
+        cases = (
+            ("compose.yml", "services:\n  service:\n    volumes:\n" + mount, False),
+            ("compose.yml", "services:\n  service:\n    environment:\n" + mount, True),
+            ("settings.yml", "services:\n  service:\n    volumes:\n" + mount, True),
+            ("compose.yml", "services:\n  service:\n    volumes:\n" + mount
+             + "      # password=" + realistic_secret_value() + "\n", True),
+        )
+        for relative, source, refused in cases:
+            with self.subTest(relative=relative, source=source):
+                self.assert_source_reference_public_cli(relative, source, refused=refused)
+
+    def test_compose_environment_references_public_cli(self) -> None:
+        required = "SAM_DB_PASSWORD: ${SAM_DB_PASSWORD" + ":?SAM_DB_PASSWORD required}\n"
+        cases = (
+            (required, "dataset"),
+            (required + "SAM_DB_URL: postgres://reader:${SAM_DB_PASSWORD:?required}@db/data\n", "context"),
+            ('SERVICE_SECRET: "${CURRENT_SECRET?set the configured value}"\n', "dataset"),
+            ("SERVICE_PASSWORD: ${SERVICE_PASSWORD:-}\n", "staged"),
+            ('SERVICE_PASSWORD: "${SERVICE_PASSWORD:-}"\n', "dataset"),
+            ("description: operator's service\nDATABASE_URL: postgres://reader:${SERVICE_PASSWORD:?required}@db/data\n", "dataset"),
+            ('DATA_SOURCE_NAME: "postgres://reader:${SERVICE_PASSWORD:?required}@db/data"\n', "dataset"),
+        )
+        for source, phase in cases:
+            with self.subTest(phase=phase, source=source):
+                self.assert_source_reference_public_cli("compose.yml", source, refused=False, phase=phase)
+
+    def test_compose_environment_references_keep_secret_refusals(self) -> None:
+        value = realistic_secret_value()
+        encoded = base64.b64encode(value.encode()).decode()
+        sources = (
+            f"SERVICE_PASSWORD: {value}\n",
+            "SERVICE_PASSWORD: ${SERVICE_PASSWORD:-" + value + "}\n",
+            "SERVICE_PASSWORD: ${SERVICE_PASSWORD:-" + encoded + "}\n",
+            "SERVICE_PASSWORD: ${SERVICE_PASSWORD:?password=" + value + "}\n",
+            "SERVICE_PASSWORD: ${SERVICE_PASSWORD:?required} " + value + "\n",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assert_source_reference_public_cli("compose.yml", source, refused=True)
+
     def test_compose_required_uri_public_bundles(self) -> None:
         for rel, username, expression, quote in (
             ("deployment/docker-compose.onprem.yml", "${DB_USER:-sam}",
