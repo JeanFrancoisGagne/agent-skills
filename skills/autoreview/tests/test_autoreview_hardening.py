@@ -148,6 +148,66 @@ class AutoreviewHardeningTests(unittest.TestCase):
             with self.subTest(source=source):
                 self.assert_source_reference_public_cli("install.sh", source, refused=True)
 
+
+    def test_python_disjoint_hunks_do_not_share_string_context_public_cli(self) -> None:
+        baseline = '\n'.join(['"""'] + ['Public source description.'] * 8
+                             + ['"""', 'import os'] + ['# retained context'] * 30
+                             + ['value = {"api_key": retained_digest}', ''])
+        updated = baseline.replace('import os', 'import hashlib').replace(
+            'value = {"api_key": retained_digest}',
+            'value = {"api_key": state.digest}')
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            path = repo / "reader.py"
+            path.write_text(baseline, encoding="utf-8")
+            git(repo, "add", path.name)
+            git(repo, "commit", "-q", "-m", "baseline")
+            path.write_text(updated, encoding="utf-8")
+            git(repo, "add", path.name)
+            argv = [sys.executable, str(SCRIPT), "--mode", "local", "--engine", "codex",
+                    "--codex-bin", str(root / "missing-reviewer")]
+            result = subprocess.run(argv, cwd=repo, env=self.source_reference_cli_environment(root),
+                                    text=True, encoding="utf-8", capture_output=True, timeout=30)
+            self.assertIn("executable not found", result.stderr)
+            self.assertIn("bundle:", result.stdout)
+            self.assertNotIn("secret-like content", result.stderr)
+
+    def test_python_reference_slices_public_cli(self) -> None:
+        for expression in ("retained_digest[:16]", "state.digest[start:16:2]"):
+            with self.subTest(expression=expression):
+                self.assert_source_reference_public_cli(
+                    "reader.py", "token = " + expression + "\n", refused=False)
+        value = realistic_secret_value()
+        for expression in (repr(value) + "[:16]", "retained_digest[" + repr(value) + ":]"):
+            with self.subTest(expression=expression):
+                self.assert_source_reference_public_cli(
+                    "reader.py", "token = " + expression + "\n", refused=True)
+
+    def test_python_reference_affixes_keep_literal_credential_refusals_public_cli(self) -> None:
+        value = realistic_secret_value()
+        encoded = '"' + ''.join('\\x' + format(ord(char), "02x") for char in value) + '"'
+        expressions = (
+            repr(value) + ' + retained_digest',
+            'retained_digest + ' + repr(value),
+            encoded + ' + retained_digest',
+            '{"record": ' + repr(value) + ', "checksum": retained_digest}',
+            repr(value[:12]) + ' + ' + repr(value[12:]),
+            '"realpass9" + retained_digest',
+            '"sk_" + "live_" + retained_digest',
+            '"f" + "x"',
+            repr(synthetic_database_uri("literal-password")) + ' + retained_digest',
+        )
+        for expression in expressions:
+            with self.subTest(expression=expression):
+                self.assert_source_reference_public_cli("reader.py", "token = " + expression + "\n", refused=True)
+
+    def test_python_reference_affixes_keep_partial_literal_refusals_public_cli(self) -> None:
+        for field, expression in (("password", "'hunter-' + suffix"), ("api_key", "'secret-' + suffix")):
+            with self.subTest(field=field):
+                self.assert_source_reference_public_cli(
+                    "reader.py", field + " = " + expression + "\n", refused=True)
+
     def test_python_keyword_values_public_cli_context_only(self) -> None:
         source = "configure(\n    allow_credentials=True,\n    methods=names,\n)\n"
         self.assert_source_reference_public_cli("reader.py", source, refused=False, phase="context")

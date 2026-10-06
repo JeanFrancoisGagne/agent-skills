@@ -6038,6 +6038,8 @@ def python_constant_reference_risk(part: ast.Constant, selector: bool) -> bool |
     return None
 
 
+
+
 def python_computed_reference_risk(part: ast.AST) -> bool | None:
     # Literal fragments can reconstruct a credential. Never evaluate them.
     literal = any(isinstance(child, ast.Constant) and isinstance(child.value, (str, bytes))
@@ -6085,6 +6087,13 @@ def python_call_reference_children(expression: str, part: ast.Call):
     return [(argument, False) for argument in python_call_literal_nodes(expression, part)]
 
 
+def python_slice_reference_children(part: ast.Slice):
+    # Integer bounds select retained bytes, not credential data. String bounds
+    # and value-producing expressions still pass the ordinary literal walk.
+    return [(bound, all((isinstance(bound, ast.Constant), type(getattr(bound, "value", None)) is int)))
+            for bound in (part.lower, part.upper, part.step) if bound is not None]
+
+
 def python_reference_children(expression: str, part: ast.AST):
     if isinstance(part, ast.Attribute):
         return [(part.value, False)]
@@ -6094,6 +6103,8 @@ def python_reference_children(expression: str, part: ast.AST):
         return python_call_reference_children(expression, part)
     if isinstance(part, ast.Dict):
         return python_dictionary_reference_children(part)
+    if isinstance(part, ast.Slice):
+        return python_slice_reference_children(part)
     return python_sequence_reference_children(part)
 
 
@@ -6911,6 +6922,15 @@ def diff_section_paths(section: str) -> tuple[str | None, str | None]:
     return old_path, new_path
 
 
+def diff_section_source_contents(section: str) -> list[tuple[str | None, str]]:
+    paths = diff_section_paths(section)
+    # Omitted lines can close a quoted block. Hunk fragments are not adjacent
+    # source, so scan every old/new fragment without carrying quote state across gaps.
+    hunks = re.split(r"(?m)(?=^@@)", section)[1:]
+    return [(rel, content) for hunk in hunks
+            for rel, content in zip(paths, unified_diff_contents(hunk))]
+
+
 def validate_review_patch(
     label: str,
     paths: list[str],
@@ -6944,12 +6964,7 @@ def validate_review_patch(
     if sections:
         expected_paths = set(paths)
         for section in sections:
-            old_path, new_path = diff_section_paths(section)
-            old_content, new_content = unified_diff_contents(section)
-            for rel, content in (
-                (old_path, old_content),
-                (new_path, new_content),
-            ):
+            for rel, content in diff_section_source_contents(section):
                 javascript_dialect = (
                     javascript_review_dialect(rel)
                     if rel is not None and rel in expected_paths
