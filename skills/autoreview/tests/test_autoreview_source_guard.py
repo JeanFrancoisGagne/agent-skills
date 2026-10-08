@@ -95,6 +95,63 @@ class AutoreviewSourceGuardPublicTests(unittest.TestCase):
                 self.assertIn("bundle:", result.stdout)
                 self.assertNotIn("secret-like content", result.stderr)
 
+    def test_python_random_byte_count_public_cli(self) -> None:
+        source = (
+            "import secrets\nenv = {"
+            + synthetic_credential_assignment(
+                "OPENCLAW_GATEWAY_TOKEN", "secrets.token_hex(24)", quoted=False,
+            )
+            + "}\n"
+        )
+        self.assert_source_reference_public_cli("replay.py", source, refused=False)
+
+    def test_python_random_byte_count_keeps_credential_refusals_public_cli(self) -> None:
+        literal = realistic_secret_value()
+        expressions = (
+            'os.environ.get("SERVICE_TOKEN", ' + repr(literal) + ')',
+            repr(literal),
+            'secrets.token_hex(' + repr(literal) + ')',
+            'secrets.token_hex(24) + ' + repr(literal),
+            'chr(65) + chr(66) + chr(67)',
+            'other.token_hex(24)',
+        )
+        for index, expression in enumerate(expressions):
+            with self.subTest(control=index):
+                source = "import secrets\n" + synthetic_credential_assignment(
+                    "token", expression, separator=" = ", quoted=False,
+                ) + "\n"
+                self.assert_source_reference_public_cli("replay.py", source, refused=True)
+
+    def test_python_random_byte_count_refuses_shadowed_bindings_public_cli(self) -> None:
+        token = synthetic_credential_assignment(
+            "token", "secrets.token_hex(24)", separator=" = ", quoted=False,
+        ) + "\n"
+        sources = (
+            "import secrets\nsecrets = selected\n" + token,
+            "import secrets\nsecrets.token_hex = selected\n" + token,
+            "import secrets\ndef read(secrets):\n    " + token,
+            "from secrets import token_hex\ntoken_hex = selected\n"
+            + synthetic_credential_assignment(
+                "token", "token_hex(24)", separator=" = ", quoted=False,
+            ) + "\n",
+            token,
+            "import secrets\ntry:\n    raise Receiver()\nexcept Receiver as secrets:\n    " + token,
+            "import secrets\nmatch lookup():\n    case secrets:\n        " + token,
+            "import secrets\nmatch lookup():\n    case [*secrets]:\n        " + token,
+            "import secrets\nmatch lookup():\n    case {**secrets}:\n        " + token,
+        )
+        for index, source in enumerate(sources):
+            with self.subTest(control=index):
+                self.assert_source_reference_public_cli("replay.py", source, refused=True)
+
+    def test_python_random_byte_count_parameter_metadata_public_cli(self) -> None:
+        for expression in ("secrets.token_hex(None)", "secrets.token_hex(nbytes=24)"):
+            with self.subTest(expression=expression):
+                source = "import secrets\n" + synthetic_credential_assignment(
+                    "token", expression, separator=" = ", quoted=False,
+                ) + "\n"
+                self.assert_source_reference_public_cli("replay.py", source, refused=False)
+
     def test_public_cli_allows_empty_anchored_environment_selectors(self) -> None:
         sources = (
             "grep -E '^SERVICE_TOKEN=' config.env | tr -d '\r'\n",
@@ -591,6 +648,85 @@ class AutoreviewSourceGuardPublicTests(unittest.TestCase):
             + " }; }\n"
         )
         self.assert_source_reference_public_cli("entry.ts", source, refused=True)
+
+
+    def test_computed_auth_reference_keeps_function_scopes_public_cli(self) -> None:
+        source = (
+            "async function resolve(ctx, model) {\n"
+            "  let requestAuth;\n"
+            "  const registry = ctx.registry;\n"
+            "  requestAuth = await registry.lookup(model);\n"
+            "  return { "
+            + synthetic_credential_assignment("apiKey", "requestAuth.apiKey", quoted=False)
+            + " };\n}\n"
+            "function other(ctx) {\n"
+            "  const choose = () => {\n"
+            "    const model = ctx.model;\n"
+            '    if (!model) { warn("No summary model is available."); return undefined; }\n'
+            "    return model;\n  };\n"
+            "  const model = choose();\n}\n"
+        )
+        self.assert_source_reference_public_cli("auth.ts", source, refused=False)
+
+    def test_gateway_computed_auth_references_public_cli(self) -> None:
+        sources = (
+            "function register(request) {\n"
+            "  const auth = lookup(request);\n"
+            "  function authorize() {\n"
+            "    const { boundGrantToken, boundCaptureKey } = auth;\n"
+            "    return boundGrantToken && boundCaptureKey ? () => Boolean(resolve({ "
+            + synthetic_credential_assignment("token", "boundGrantToken", quoted=False)
+            + ", captureKey: boundCaptureKey })) : undefined;\n  }\n}\n"
+            "function other() { const auth = { message: 'No authorization was requested.' }; }\n",
+            "const startupAuthOverride = options.auth;\n"
+            "const override = { ...(isReference(startupAuthOverride.token) ? { "
+            + synthetic_credential_assignment("token", "structuredClone(startupAuthOverride.token)", quoted=False)
+            + " } : {}) };\n",
+        )
+        for source in sources:
+            with self.subTest(source_kind="scope or call argument"):
+                self.assert_source_reference_public_cli("gateway.ts", source, refused=False)
+
+    def test_scoped_auth_origins_keep_credential_refusals_public_cli(self) -> None:
+        value = json.dumps(realistic_secret_value())
+        projection = "return { " + synthetic_credential_assignment("apiKey", "requestAuth.apiKey", quoted=False) + " };"
+        sources = (
+            "const model = " + value + "; function resolve() { const requestAuth = lookup(model); " + projection + " }",
+            "function resolve(model = " + value + ") { const requestAuth = lookup(model); " + projection + " }",
+            "function resolve(model) { let requestAuth = lookup(model); function mutate() { requestAuth.apiKey = " + value + "; } " + projection + " }",
+            "function resolve(model) { const requestAuth = lookup(model); const alias = requestAuth; Object.assign(alias, { apiKey: " + value + " }); " + projection + " }",
+            "const startupAuthOverride = { opaque: " + value + " }; const override = { "
+            + synthetic_credential_assignment("token", "structuredClone(startupAuthOverride.opaque)", quoted=False) + " };",
+            "const startupAuthOverride = options.auth; const override = { "
+            + synthetic_credential_assignment("token", "structuredClone(startupAuthOverride.token, " + value + ")", quoted=False) + " };",
+        )
+        for source in sources:
+            with self.subTest(source_kind="literal, default, captured write, alias or call"):
+                self.assert_source_reference_public_cli("auth.ts", source, refused=True)
+
+    def test_imported_entropy_and_callback_origins_public_cli(self) -> None:
+        prefix = 'import crypto from "node:crypto";\n'
+        projection = "return { " + synthetic_credential_assignment("token", "validatedBinding.boundGrantToken", quoted=False) + " };"
+        source = (
+            prefix + "function register(request) {\n"
+            'const owner = crypto.randomBytes(32).toString("hex");\n'
+            'const observe = () => { log("The response stream is closed."); };\n'
+            "const validatedBinding = validate({ request, owner, observe }); " + projection + " }\n"
+        )
+        self.assert_source_reference_public_cli("gateway.ts", source, refused=False)
+        value = json.dumps(realistic_secret_value())
+        refused = (
+            "function resolve(model) { const requestAuth = lookup(model); const callback = () => " + value + "; const validatedBinding = lookup(callback); " + projection + " }",
+            prefix + 'function resolve(crypto) { const validatedBinding = crypto.randomBytes(32).toString("hex"); ' + projection + " }",
+            prefix + 'const alias = crypto; alias.randomBytes = () => ' + value + '; function resolve() { const validatedBinding = crypto.randomBytes(32).toString("hex"); ' + projection + " }",
+            prefix + 'crypto.randomBytes = custom; function resolve() { const validatedBinding = crypto.randomBytes(32).toString("hex"); ' + projection + " }",
+            "function resolve() { const validatedBinding = String.fromCharCode(65, 55, 102, 57); " + projection + " }",
+            "const undefined = { opaque: " + value + " }; const choice = condition ? runtime : undefined; const result = { "
+            + synthetic_credential_assignment("token", "choice.opaque", quoted=False) + " };",
+        )
+        for source in refused:
+            with self.subTest(source_kind="returned literal, shadow, mutation, numeric constructor or absence shadow"):
+                self.assert_source_reference_public_cli("gateway.ts", source, refused=True)
 
 
 if __name__ == "__main__":
