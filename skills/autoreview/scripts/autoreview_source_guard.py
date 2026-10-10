@@ -4976,6 +4976,25 @@ def python_slice_reference_children(part: ast.Slice):
     return [(bound, all((isinstance(bound, ast.Constant), type(getattr(bound, "value", None)) is int)))
             for bound in (part.lower, part.upper, part.step) if bound is not None]
 
+def python_index_miss_comparison(part: ast.Compare) -> bool:
+    # find() uses a negative index for absence. The zero in this predicate
+    # selects retained source; it cannot contribute credential bytes.
+    # Other numeric data and every string comparison keep the strict walk.
+    return all((
+        python_named_reference(part.left), len(part.ops) == 1,
+        isinstance(part.ops[0], ast.Lt), len(part.comparators) == 1,
+        isinstance(part.comparators[0], ast.Constant),
+        type(getattr(part.comparators[0], "value", None)) is int,
+        getattr(part.comparators[0], "value", None) == 0,
+    ))
+
+
+def python_comparison_reference_children(part: ast.Compare):
+    if python_index_miss_comparison(part):
+        return [(part.left, False), (part.comparators[0], True)]
+    return python_sequence_reference_children(part)
+
+
 def python_reference_children(
     expression: str, part: ast.AST, *, random_byte_metadata: bool = False,
 ):
@@ -4985,11 +5004,12 @@ def python_reference_children(
         return [(part.value, False), (part.slice, True)]
     if isinstance(part, ast.Call):
         return python_call_reference_children(expression, part, random_byte_metadata=random_byte_metadata)
-    if isinstance(part, ast.Dict):
-        return python_dictionary_reference_children(part)
-    if isinstance(part, ast.Slice):
-        return python_slice_reference_children(part)
-    return python_sequence_reference_children(part)
+    owner = {
+        ast.Dict: python_dictionary_reference_children,
+        ast.Slice: python_slice_reference_children,
+        ast.Compare: python_comparison_reference_children,
+    }.get(type(part), python_sequence_reference_children)
+    return owner(part)
 
 def python_reference_children_risk(children, inspect, depth: int) -> bool | None:
     risks = [inspect(child, selector=selector, depth=depth + 1) for child, selector in children]
@@ -5117,43 +5137,108 @@ def python_reviewed_literal_prefixes(text: str, contexts, depth: int) -> set[int
         reviewed.update(positions)
     return reviewed
 
-def python_statement_keyword_starts(text: str, start: int, end: int) -> set[int]:
+def python_null_uuid_operands(zero: ast.AST, count: ast.AST) -> bool:
+    return all((
+        isinstance(zero, ast.Constant), getattr(zero, "value", None) == "0",
+        isinstance(count, ast.Constant), type(getattr(count, "value", None)) is int,
+        getattr(count, "value", None) == 32,
+    ))
+
+
+def python_null_uuid_repeat(part: ast.AST) -> bool:
+    if not all((isinstance(part, ast.BinOp), isinstance(getattr(part, "op", None), ast.Mult))):
+        return False
+    return any(python_null_uuid_operands(zero, count)
+               for zero, count in ((part.left, part.right), (part.right, part.left)))
+
+
+def python_volume_fixture_entries(part: ast.Dict):
+    if len(part.keys) != 2 or any(not isinstance(key, ast.Constant) for key in part.keys):
+        return None
+    keys = [key.value for key in part.keys]
+    if set(keys) != {"token", "volume_name"}:
+        return None
+    index = keys.index("token")
+    return part.keys[index], part.values[index], part.values[keys.index("volume_name")]
+
+
+def python_volume_fixture_prefix(part: ast.AST) -> bool:
+    prefix = part.value if isinstance(part, ast.Constant) else None
+    if not isinstance(prefix, str):
+        return False
+    return all((
+        re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}-", prefix) is not None,
+        not secret_literal_risk(repr(prefix)),
+    ))
+
+
+def python_volume_fixture_name(part: ast.AST) -> bool:
+    if not all((isinstance(part, ast.BinOp), isinstance(getattr(part, "op", None), ast.Add))):
+        return False
+    return python_volume_fixture_prefix(part.left) and python_null_uuid_repeat(part.right)
+
+
+def python_volume_fixture_token(part: ast.Dict) -> ast.Constant | None:
+    entries = python_volume_fixture_entries(part)
+    if entries is None:
+        return None
+    key, token, name = entries
+    return key if python_null_uuid_repeat(token) and python_volume_fixture_name(name) else None
+
+
+def python_statement_reference_starts(text: str, start: int, end: int) -> tuple[set[int], set[int]]:
     source = text[start:end]
     start += len(source) - len(source.lstrip())
     source = source.strip()
     if not source or len(source) > 8192:
-        return set()
+        return set(), set()
     try:
         tree = ast.parse(source)
     except (SyntaxError, ValueError, RecursionError):
-        return set()
-    return {
+        return set(), set()
+    keywords = {
         start + python_literal_source_position(source, part)
         for part in ast.walk(tree) if isinstance(part, ast.keyword)
     }
+    return keywords, python_statement_fixture_starts(source, start, tree)
 
-def python_has_assignment_keyword(assignment_prefixes) -> bool:
-    return any(prefix.group().rstrip().endswith("=") for prefix in assignment_prefixes)
 
-def python_keyword_assignment_starts(text: str, assignment_prefixes) -> set[int]:
-    # Only complete bounded statements establish keyword commas. Unknown
-    # syntax keeps tuple scanning, including every literal after a comma.
-    if not python_has_assignment_keyword(assignment_prefixes):
-        return set()
+def python_statement_fixture_starts(source: str, start: int, tree: ast.Module) -> set[int]:
+    fixtures = set()
+    # Only a complete two-field volume identity proves this null UUID is
+    # fixture metadata. Bare token repeats, duplicate keys and suffix data
+    # keep their normal checks; no UUID value is globally exempted.
+    for part in ast.walk(tree):
+        if isinstance(part, ast.Dict):
+            token = python_volume_fixture_token(part)
+            if token is not None:
+                fixtures.add(start + python_literal_source_position(source, token))
+    return fixtures
+
+
+def python_assignment_statement_starts(text: str, assignment_prefixes) -> tuple[set[int], set[int]]:
+    # Only complete bounded statements establish keyword commas and paired
+    # fixture identities. Unknown syntax keeps every original literal check.
+    if not assignment_prefixes:
+        return set(), set()
     offsets = [0]
     for line in text.splitlines(keepends=True):
         offsets.append(offsets[-1] + len(line))
-    starts: set[int] = set()
+    keywords: set[int] = set()
+    fixtures: set[int] = set()
     start = 0
     try:
         for token in tokenize.generate_tokens(io.StringIO(text).readline):
             if token.type == tokenize.NEWLINE:
                 end = offsets[min(token.start[0] - 1, len(offsets) - 1)] + token.start[1]
-                starts.update(python_statement_keyword_starts(text, start, end))
+                local_keywords, local_fixtures = python_statement_reference_starts(text, start, end)
+                keywords.update(local_keywords)
+                fixtures.update(local_fixtures)
                 start = end + len(token.string)
     except (tokenize.TokenError, IndentationError, SyntaxError):
         pass
-    return starts
+    return keywords, fixtures
+
 
 def python_assignment_reference_prefixes(text: str, prefix, contexts, literal_prefixes,
                                          keyword_starts=(), *, random_byte_metadata: bool = False) -> set[int] | None:
@@ -5179,15 +5264,174 @@ def python_assignment_reference_prefixes(text: str, prefix, contexts, literal_pr
         return references
     return set()
 
+def python_supported_resolver_import(part: ast.AST) -> bool:
+    return all((
+        isinstance(part, ast.ImportFrom), getattr(part, "module", None) == "core.secrets",
+        getattr(part, "level", None) == 0,
+        any(alias.name == "resolve_secret" and alias.asname is None
+            for alias in getattr(part, "names", ())),
+    ))
+
+
+def python_resolver_binding_risk(part: ast.AST) -> bool:
+    if isinstance(part, ast.Name):
+        return part.id == "resolve_secret" and isinstance(part.ctx, (ast.Store, ast.Del))
+    if isinstance(part, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.arg)):
+        return getattr(part, "name", getattr(part, "arg", None)) == "resolve_secret"
+    if isinstance(part, (ast.Import, ast.ImportFrom)):
+        return python_resolver_import_risk(part)
+    return python_resolver_dynamic_binding(part)
+
+
+def python_resolver_import_risk(part: ast.AST) -> bool:
+    for alias in part.names:
+        if alias.name == "*":
+            return True
+        bound = alias.asname or alias.name.split(".")[0]
+        if bound == "resolve_secret" and not all((
+            python_supported_resolver_import(part), alias.name == "resolve_secret", alias.asname is None,
+        )):
+            return True
+    return False
+
+
+def python_resolver_dynamic_binding(part: ast.AST) -> bool:
+    if isinstance(part, (ast.Global, ast.Nonlocal)):
+        return "resolve_secret" in part.names
+    if isinstance(part, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+        return part.name == "resolve_secret"
+    if isinstance(part, ast.MatchMapping):
+        return part.rest == "resolve_secret"
+    if isinstance(part, ast.Call) and isinstance(part.func, ast.Name):
+        return part.func.id in {"exec", "eval", "globals", "locals", "vars", "__import__"}
+    return python_resolver_namespace_access(part)
+
+
+def python_resolver_namespace_access(part: ast.AST) -> bool:
+    return all((
+        isinstance(part, ast.Attribute), getattr(part, "attr", None) == "modules",
+        isinstance(getattr(part, "value", None), ast.Name),
+        getattr(getattr(part, "value", None), "id", None) == "sys",
+    ))
+
+
+def python_statement_blocks(tree: ast.Module):
+    for part in ast.walk(tree):
+        for _, value in ast.iter_fields(part):
+            if python_statement_block(value):
+                yield value
+
+
+def python_statement_block(value: object) -> bool:
+    return all((isinstance(value, list), bool(value))) and all(
+        isinstance(item, ast.stmt) for item in value
+    )
+
+
+def python_resolver_block_calls(text: str, block) -> set[int]:
+    bound = False
+    positions = set()
+    for statement in block:
+        if python_supported_resolver_import(statement):
+            bound = True
+        expression = getattr(statement, "value", None)
+        if bound and python_resolver_call_name(expression):
+            positions.add(python_literal_source_position(text, expression.func))
+    return positions
+
+
+def python_resolver_call_name(part: ast.AST | None) -> bool:
+    return all((
+        isinstance(part, ast.Call), isinstance(getattr(part, "func", None), ast.Name),
+        getattr(getattr(part, "func", None), "id", None) == "resolve_secret",
+    ))
+
+
+def python_resolver_reference_risk(part: ast.AST, parent: ast.AST | None) -> bool:
+    if isinstance(part, ast.Name) and part.id == "resolve_secret":
+        if not isinstance(part.ctx, ast.Load):
+            return True
+        # Passing or mutating the imported function loses its lookup contract.
+        # Only a direct call receiver keeps this source proof.
+        return not isinstance(parent, ast.Call) or parent.func is not part
+    return python_resolver_binding_risk(part)
+
+
+def python_resolver_tree_binding_risk(tree: ast.Module) -> bool:
+    parents = {child: part for part in ast.walk(tree) for child in ast.iter_child_nodes(part)}
+    return any(python_resolver_reference_risk(part, parents.get(part)) for part in ast.walk(tree))
+
+
+def python_bound_resolver_calls(text: str) -> set[int]:
+    if "resolve_secret" not in text:
+        return set()
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError):
+        return set()
+    # The supplied API contract owns this exact import. A local function,
+    # method, alias, rebinding or incomplete hunk cannot prove that contract.
+    if python_resolver_tree_binding_risk(tree):
+        return set()
+    positions = set()
+    for block in python_statement_blocks(tree):
+        positions.update(python_resolver_block_calls(text, block))
+    return positions
+
+
+def python_resolver_boolean_option(keyword: ast.keyword) -> bool:
+    return all((
+        keyword.arg in {"required", "audit"}, isinstance(keyword.value, ast.Constant),
+        type(getattr(keyword.value, "value", None)) is bool,
+    ))
+
+
+def python_resolver_selector(part: ast.AST) -> bool:
+    if not isinstance(part, ast.Constant) or not isinstance(part.value, str):
+        return False
+    return all((
+        python_structured_environment_selector(part.value),
+        not secret_literal_risk(part.value),
+        safe_credential_lookup_argument("os.getenv", repr(part.value), 0),
+    ))
+
+
+def python_structured_environment_selector(value: str) -> bool:
+    # The argument names an environment field. Opaque single words and long
+    # encoded components cannot establish that role, even with an import.
+    return re.fullmatch(r"[A-Z][A-Z0-9]{0,18}(?:_[A-Z][A-Z0-9]{0,18})+", value) is not None
+
+
+def python_bound_resolver_assignment(text: str, prefix, positions: set[int]) -> bool:
+    source = text[prefix.end():prefix.end() + 8192]
+    start = prefix.end() + len(source) - len(source.lstrip())
+    if start not in positions:
+        return False
+    parsed = python_assignment_expression(text, prefix.end(), mapping_entry=False)
+    if parsed is None:
+        return False
+    _, call = parsed
+    if not all((python_resolver_call_name(call), len(getattr(call, "args", ())) == 1)):
+        return False
+    return python_resolver_selector(call.args[0]) and all(
+        python_resolver_boolean_option(keyword) for keyword in call.keywords
+    )
+
+
 def python_source_reference_preflight(text: str, assignment_prefixes, depth: int) -> set[int] | None:
     contexts = string_contexts_at(text, {prefix.start() for prefix in assignment_prefixes})
     references = python_reviewed_literal_prefixes(text, contexts, depth)
     if references is None:
         return None
     literal_prefixes = python_literal_prefix_index(contexts)
-    keyword_starts = python_keyword_assignment_starts(text, assignment_prefixes)
+    keyword_starts, fixture_starts = python_assignment_statement_starts(text, assignment_prefixes)
+    references.update(fixture_starts)
     random_byte_metadata = python_stdlib_random_byte_source(text)
+    resolver_calls = python_bound_resolver_calls(text)
     for prefix in assignment_prefixes:
+        if any((prefix.start() in fixture_starts, python_bound_resolver_assignment(text, prefix, resolver_calls))):
+            references.add(prefix.start())
+            continue
         assignment = python_assignment_reference_prefixes(
             text, prefix, contexts, literal_prefixes, keyword_starts, random_byte_metadata=random_byte_metadata,
         )
