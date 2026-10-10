@@ -2439,6 +2439,15 @@ def delimited_synthetic_secret_fixture(value: str, normalized_key: str) -> bool:
     )
     return marker is not None and marker.group("prefix") in SYNTHETIC_SECRET_PREFIXES
 
+def role_marked_synthetic_secret_fixture(value: str, normalized_key: str) -> bool:
+    # A short role label plus an explicit fixture marker and the credential kind
+    # names synthetic data. Extra bytes and mismatched fields stay refused.
+    marker = re.fullmatch(
+        r"(?:[a-z]{1,16}-){1,2}(?P<prefix>[a-z]+)-" + re.escape(normalized_key.rsplit("-", 1)[-1]), value,
+    )
+    return marker is not None and marker.group("prefix") in SYNTHETIC_SECRET_PREFIXES
+
+
 def synthetic_secret_fixture(value: str, key: str) -> bool:
     normalized = value.casefold()
     if normalized in SECRET_PLACEHOLDER_VALUES:
@@ -2459,6 +2468,7 @@ def synthetic_secret_fixture(value: str, key: str) -> bool:
         any(normalized == f"{prefix}-{normalized_key}"
             for prefix in SYNTHETIC_SECRET_PREFIXES),
         delimited_synthetic_secret_fixture(value, normalized_key),
+        role_marked_synthetic_secret_fixture(normalized, normalized_key),
     ))
 
 def safe_secret_assignment_suffix(
@@ -3600,11 +3610,39 @@ def typescript_type_reference_ranges(text: str, dialect: str | None) -> tuple[tu
         + identifier + r"(?:\." + identifier + r")*;[ \t]*\r?$"
     )
     code = javascript_binding_code(text)
-    return tuple(
+    return typescript_object_member_reference_ranges(text, code) + tuple(
         match.span("assignment") for match in declaration.finditer(text)
         if match.end() - match.start() <= 8192
         and code[match.start() : match.end()] == match.group()
     )
+
+def typescript_object_type_ranges(text: str, code: str) -> tuple[tuple[int, int], ...]:
+    declaration = re.compile(
+        r"(?m)^[ \t]*(?:export[ \t]+)?type[ \t]+[A-Za-z_$][\w$]*[ \t]*=[ \t]*"
+        r"(?:[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*[ \t]*&[ \t]*)?\{",
+    )
+    ranges = []
+    for match in declaration.finditer(code):
+        start = match.end() - 1
+        end = javascript_balanced_binding_end(code, start, "{", "}")
+        if end is not None and end - match.start() <= 8192 and re.match(r"[ \t]*;[ \t]*\r?$", code[end:], re.MULTILINE):
+            ranges.append((start, end))
+    return tuple(ranges)
+
+
+def typescript_object_member_reference_ranges(text: str, code: str) -> tuple[tuple[int, int], ...]:
+    # Only named type members inside a complete object type have no value.
+    # Raw bytes must match masked code, so literal types keep their checks.
+    name = r"[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*(?:\[\])*"
+    member = re.compile(r"(?P<assignment>[A-Za-z_$][\w$]*\??\s*:\s*)"
+                        + name + r"(?:\s*\|\s*" + name + r")*\s*;")
+    return tuple(
+        match.span("assignment") for start, end in typescript_object_type_ranges(text, code)
+        for match in member.finditer(text, start, end)
+        if text[start:match.start()].rstrip().endswith(("{", ";"))
+        and text[match.start():match.end()] == code[match.start():match.end()]
+    )
+
 
 def javascript_object_binding_names(binding: str) -> set[str] | None:
     identifier = r"[A-Za-z_$][A-Za-z0-9_$]*"
@@ -4184,15 +4222,13 @@ def javascript_expression_uses_root(expression: str, root: str) -> bool:
                for reference in references)
 
 
-def javascript_proven_destructured_alias_names(
+def javascript_possible_destructured_alias_names(
     binding: str, expression: str, kind: str, span: int,
 ) -> set[str] | None:
-    if kind != "const" or span > 8192:
+    if kind not in {"const", "let"} or span > 8192:
         return None
-    value = javascript_initializer_value_code(expression).strip()
-    if not (re.fullmatch(URI_CREDENTIAL_REFERENCE_TEXT, value)
-            or re.fullmatch(URI_CREDENTIAL_REFERENCE_TEXT, expression.strip())):
-        return None
+    # Calls and spreads may return an input object. Track their simple output
+    # bindings as possible aliases; the origin graph still scans every input.
     return javascript_object_binding_names(binding)
 
 
@@ -4211,7 +4247,7 @@ def javascript_destructured_aliases(text: str, code: str, root: str) -> set[str]
         expression = fallback_expression(text[end + assignment.end():], typescript=True)
         if not javascript_expression_uses_root(expression, root):
             continue
-        names = javascript_proven_destructured_alias_names(
+        names = javascript_possible_destructured_alias_names(
             text[start:end], expression, declaration.group("kind"),
             end + assignment.end() + len(expression) - start,
         )
@@ -4233,13 +4269,109 @@ def javascript_binding_alias_roots(text: str, code: str, root: str) -> set[str] 
         if destructured is None:
             return None
         for alias in edges.get(source, set()) | destructured:
-            if alias in aliases:
+            if javascript_ignorable_alias(text, code, alias, edges, aliases):
                 continue
             if len(aliases) >= MAX_JAVASCRIPT_INITIALIZER_ROOTS:
                 return None
             aliases.add(alias)
             pending.append(alias)
     return aliases
+
+def javascript_ignorable_alias(text, code, alias, edges, aliases) -> bool:
+    return alias in aliases or (alias not in edges
+        and javascript_destructured_aliases(text, code, alias) == set()
+        and not javascript_alias_mutation_risk(code, alias, ""))
+
+
+def javascript_member_write_expressions(text, code, alias) -> list[str] | None:
+    values = []
+    references = re.finditer(r"(?<![\w$?.])" + re.escape(alias) + r"(?![\w$])", code)
+    for reference in references:
+        value = javascript_member_write_expression(text, code, reference.end())
+        if value is None:
+            return None
+        values.extend(value)
+    return values
+
+
+def javascript_member_write_expression(text, code, start: int) -> list[str] | None:
+    members = javascript_mutation_members(code, start)
+    if members is None:
+        return None
+    end, computed = members
+    assignment = re.match(r"\s*(?:\?\?|\|\||&&|<<|>>>?|[+\-*/%&|^])?=(?!=|>)", code[end:])
+    if end == start or assignment is None:
+        return []
+    if computed:
+        return None
+    return [fallback_expression(text[end + assignment.end():], typescript=True)]
+
+
+def javascript_mutation_alias_writes(text, code, root: str) -> list[str] | None:
+    aliases = javascript_binding_alias_roots(text, code, root)
+    if aliases is None or any(javascript_object_mutation_risk(code, alias) for alias in aliases):
+        return None
+    return javascript_alias_write_values(text, code, aliases)
+
+
+def javascript_alias_write_values(text, code, aliases) -> list[str] | None:
+    values = []
+    for alias in aliases:
+        writes = javascript_member_write_expressions(text, code, alias)
+        if writes is None:
+            return None
+        values.extend(writes)
+    return values
+
+
+def javascript_mutation_origin_expressions(text, code, root: str) -> list[str] | None:
+    # This scan proves literal absence in a write value, not binding immutability.
+    # Include all initializers and member writes, including simple let copies.
+    # A local class can return bytes through a method or getter. Its origin
+    # is unresolved here, so a write cannot claim literal absence from it.
+    if re.search(r"\bclass\s+" + re.escape(root) + r"(?![\w$])", code):
+        return None
+    writes = javascript_mutation_alias_writes(text, code, root)
+    returned = javascript_local_function_origins(text, code, root)
+    if writes is None or returned is None:
+        return None
+    values = javascript_binding_initializers(text, code, root) + returned + writes
+    return javascript_mutation_destructured_inputs(text, code, root, values)
+
+
+def javascript_mutation_destructured_inputs(text, code, root, values) -> list[str] | None:
+    declarations = re.finditer(r"\b(?P<kind>const|let|var)\s*(?P<opening>[{\[])", code)
+    for declaration in declarations:
+        start = declaration.end() - 1
+        end = javascript_balanced_binding_end(code, start, code[start], {"{": "}", "[": "]"}[code[start]])
+        if end is None:
+            return None
+        if not re.search(r"(?<![\w$])" + re.escape(root) + r"(?![\w$])", code[start:end]):
+            continue
+        value = javascript_destructured_initializer(text, code, start, end, root)
+        if declaration.group("kind") == "var" or value is None:
+            return None
+        values.append(value)
+    return values
+
+
+def javascript_mutation_value_literal_risk(text, code, expressions) -> bool:
+    pending = javascript_binding_proven_references(text, code, expressions)
+    checked = set()
+    while pending:
+        root = pending.pop()
+        if root in checked:
+            continue
+        if len(checked) >= MAX_JAVASCRIPT_INITIALIZER_ROOTS:
+            return True
+        values = javascript_mutation_origin_expressions(text, code, root.split(".")[0])
+        links = javascript_binding_proven_references(text, code, values) if values is not None else None
+        if links is None:
+            return True
+        checked.add(root)
+        pending.update(links - checked)
+    return pending is None
+
 
 def javascript_mutation_members(code: str, cursor: int) -> tuple[int, bool] | None:
     computed = False
@@ -4287,8 +4419,8 @@ def javascript_alias_mutation_risk(code: str, alias: str, original: str) -> bool
                for reference in references) or javascript_object_mutation_risk(code, alias)
 
 def javascript_binding_mutation_risk(text: str, code: str, root: str) -> bool:
-    aliases = javascript_binding_alias_roots(text, code, root)
-    return aliases is None or any(javascript_alias_mutation_risk(code, alias, root) for alias in aliases)
+    writes = javascript_mutation_alias_writes(text, code, root)
+    return writes is None or javascript_mutation_value_literal_risk(text, code, writes)
 
 def javascript_unsupported_binding_origin(text: str, code: str, root: str) -> bool:
     return javascript_destructured_binding_initializers(text, code, root) is None \
