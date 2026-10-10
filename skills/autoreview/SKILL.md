@@ -306,11 +306,15 @@ suspected credentials as P0 findings without reproducing their values. Harmless
 placeholders and test fixtures are not credentials. Autoreview does not require
 or invoke an external secret scanner. Never work around an isolation failure.
 
-### Intentional scanner-free policy
+### Checks before transmission
 
-Keep approved secret scanning outside autoreview; reviewer findings happen after
-transmission. Reintroducing a scanner requires an explicit maintainer decision.
-See [#240](https://github.com/openclaw/agent-skills/pull/240) for rationale and history.
+The shared stdlib source guard checks retained diff metadata, every old/new hunk,
+captured text files, committed source context, and supplied prompt text before
+partitioning. Literal credentials refuse the review; declared references remain
+reviewable only when their local origins and suffixes pass the same checks.
+Keep capture ownership, evidence rechecks, and reviewer isolation enabled.
+No external scanner installation or repository configuration is required.
+Use the shared installation and the downstream Markdown entrypoint.
 
 ### Reviewer isolation
 

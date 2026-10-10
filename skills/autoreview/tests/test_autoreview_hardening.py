@@ -4523,6 +4523,15 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertNotIn("commit metadata", redacted)
 
     def test_review_patch_preserves_combined_and_headerless_hunk_content(self) -> None:
+        benign_code = "const observedCount = 7;"
+        for patch in (
+            "@@ -0,0 +1 @@\n+" + benign_code + "\n",
+            "diff --cc src/runtime.ts\n"
+            "@@@ -0,0 -0,0 +1 @@@\n++" + benign_code + "\n",
+        ):
+            with self.subTest(patch=patch):
+                validated = self.helper["validate_review_patch"](["src/runtime.ts"], patch)
+                self.assertIn(benign_code, validated)
         credential_shaped_code = '+token = "ordinary-hardcoded-value-12345"\n'
         for patch in (
             "@@ -0,0 +1 @@\n" + credential_shaped_code,
@@ -4531,11 +4540,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "++token = \"ordinary-hardcoded-value-12345\"\n",
         ):
             with self.subTest(patch=patch):
-                validated = self.helper["validate_review_patch"](
-                    ["src/runtime.ts"],
-                    patch,
-                )
-                self.assertIn("ordinary-hardcoded-value-12345", validated)
+                with self.assertRaisesRegex(SystemExit, "secret-like content"):
+                    self.helper["validate_review_patch"](["src/runtime.ts"], patch)
 
     def test_tracked_sensitive_paths_are_omitted_in_all_modes(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -4644,7 +4650,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             with self.subTest(rel=rel):
                 self.assertIsNone(self.helper["sensitive_repo_path_risk"](rel))
 
-    def test_untracked_credential_shaped_source_content_is_reviewed(self) -> None:
+    def test_untracked_credential_shaped_source_content_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
             source = 'const token = "ordinary-hardcoded-value-12345";\n'
@@ -4652,9 +4658,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
             path.parent.mkdir()
             path.write_text(source, encoding="utf-8")
 
-            bundle, _paths, _mixed, _spans, _commit, _images = self.helper["local_bundle"](repo)
-
-            self.assertIn("ordinary-hardcoded-value-12345", bundle)
+            with self.assertRaisesRegex(SystemExit, "secret-like content"):
+                self.helper["local_bundle"](repo)
 
     def test_untracked_design_token_artifacts_remain_reviewable(self) -> None:
         for rel in (
@@ -4755,30 +4760,27 @@ class AutoreviewHardeningTests(unittest.TestCase):
         token_name = "to" + "ken"
         key_name = "api_" + "key"
         secret_name = "api_" + "secret"
+        # Both hunk sides include the external binding declarations. A label
+        # cannot prove an undeclared credential root or exempt literal bytes.
         safe_patch = (
             "diff --git a/provider.ts b/provider.ts\n"
             "--- a/provider.ts\n"
             "+++ b/provider.ts\n"
-            "@@ -1 +1,6 @@\n"
+            "@@ -1,3 +1,8 @@\n"
+            " declare const data: { session: { access_token: string } };\n"
+            " declare const providerConfig: { api_key: string; api_secret: string };\n"
             f"-const {token_name} = data.session?.access_token;\n"
             f"+const {token_name} = data.session?.access_token;\n"
             "+const api" + f"Key = providerConfig.{key_name};\n"
             "+const api" + "Sec" + f"ret = providerConfig.{secret_name};\n"
-            f'+const fixture = {{ {key_name}: "test-key" }};\n'
-            f'+const fixtureSecret = {{ {secret_name}: "test-secret" }};\n'
-            f'+const session = {{ access_{token_name}: "test-token" }};\n'
+            f'+const fixture = {{ {key_name}: "test-api-key" }};\n'
+            f'+const fixtureSecret = {{ {secret_name}: "test-api-secret" }};\n'
+            f'+const session = {{ access_{token_name}: "test-access-token" }};\n'
         )
-
-        self.assertEqual(
-            self.helper["validate_review_patch"](
-                ["provider.ts"],
-                safe_patch,
-            ),
-            safe_patch,
-        )
+        self.assertEqual(self.helper["validate_review_patch"](["provider.ts"], safe_patch), safe_patch)
 
     def test_secret_detector_allows_typescript_credential_plumbing_fixture(self) -> None:
-        source = (FIXTURES / "typescript-benign-references.ts").read_text(
+        source = (FIXTURES / "typescript-declared-credential-references.ts").read_text(
             encoding="utf-8"
         )
 

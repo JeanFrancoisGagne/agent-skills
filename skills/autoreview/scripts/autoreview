@@ -11,6 +11,7 @@ import copy
 import functools
 import hashlib
 import io
+import importlib.util
 import json
 import math
 import os
@@ -33,6 +34,17 @@ import warnings
 from collections.abc import Callable, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, NamedTuple
+
+
+# Resolve this required sibling from the shared installation, including runpy callers.
+# A reviewed repository's module search path must not choose the guard implementation.
+_source_guard_spec = importlib.util.spec_from_file_location(
+    "autoreview_source_guard", Path(__file__).with_name("autoreview_source_guard.py"),
+)
+if _source_guard_spec is None or _source_guard_spec.loader is None:
+    raise RuntimeError("required source guard is unavailable")
+source_guard = importlib.util.module_from_spec(_source_guard_spec)
+_source_guard_spec.loader.exec_module(source_guard)
 
 
 ENGINES = ("codex", "claude", "amp", "pi", "kimi")
@@ -92,7 +104,8 @@ SENSITIVE_NAME_PATTERNS = [
 TRACKED_SENSITIVE_NAME_PATTERNS = [
     CREDENTIAL_FILE_PATTERN,
     re.compile(
-        r"(^|/)\.env(?:$|/|[._-](?!(?:example|sample|template)$)[^/]*)",
+        r"(^|/)\.env(?!(?:[._-]|\.(?a:[a-z0-9][a-z0-9_-]*)\.)"
+        r"(?:example|sample|template)\Z)(?:$|/|[._-][^/]*)",
         re.IGNORECASE,
     ),
     re.compile(r"(^|/)(id_rsa|id_dsa|id_ecdsa|id_ed25519)(\.pub)?$", re.IGNORECASE),
@@ -2011,7 +2024,9 @@ def discover_repo_root(start: Path) -> Path | None:
 
 
 def current_branch(repo: Path) -> str:
-    return git(repo, "branch", "--show-current", check=False).strip() or "detached"
+    branch = git(repo, "branch", "--show-current", check=False).strip() or "detached"
+    source_guard.require_no_secret_values("branch name", branch)
+    return branch
 
 
 def is_dirty(repo: Path) -> bool:
@@ -2216,6 +2231,7 @@ def first_executable_candidate(path: Path, *, reject_root: Path | None = None) -
 
 
 def validate_git_ref(repo: Path, ref: str, label: str, *, pin: bool = False) -> str:
+    source_guard.require_no_secret_values("Git ref", ref)
     if not ref or ref.startswith("-") or ":" in ref or "\0" in ref or any(char.isspace() for char in ref):
         raise SystemExit(f"unsafe {label} ref: {ref}")
     result = git(
@@ -2601,7 +2617,9 @@ def validate_review_patch(
     patch: str,
 ) -> str:
     blocked_paths = tracked_sensitive_paths(paths)
-    return omit_tracked_sensitive_diff_units(patch, paths, blocked_paths)
+    retained = omit_tracked_sensitive_diff_units(patch, paths, blocked_paths)
+    source_guard.require_safe_diff(paths, retained, review_bundle_units(retained))
+    return retained
 
 
 def binary_diff_paths(numstat: str) -> list[str]:
@@ -2833,6 +2851,7 @@ def file_bundle_snapshot(
         text = data.decode("utf-8")
     except UnicodeDecodeError:
         return "", "non-UTF-8 file"
+    source_guard.require_safe_source("file source", normalized, text)
     return text, None
 
 
@@ -2960,7 +2979,9 @@ def local_status(repo: Path, untracked: list[str], *, redact: bool = False) -> s
     status = git(repo, "status", "--short", "--untracked-files=no").rstrip()
     lines = [status] if status else []
     lines.extend(f"?? {rel}" for rel in untracked)
-    return "\n".join(lines)
+    status = "\n".join(lines)
+    source_guard.require_no_secret_values("Git status", status)
+    return status
 
 
 def mixed_source_text(path: str, version: str, data: bytes) -> str:
@@ -2968,9 +2989,11 @@ def mixed_source_text(path: str, version: str, data: bytes) -> str:
     if b"\0" in data:
         raise SystemExit(f"{label}: binary file")
     try:
-        return data.decode("utf-8")
+        text = data.decode("utf-8")
     except UnicodeDecodeError:
         raise SystemExit(f"{label}: non-UTF-8 file") from None
+    source_guard.require_safe_source("mixed source", path, text)
+    return text
 
 
 def git_source_version(repo: Path, path: str, ref: str | None) -> SourceVersion:
@@ -3503,6 +3526,7 @@ def commit_bundle(repo: Path, commit_ref: str) -> CapturedBundle:
     if not blocked_paths:
         commit_summary = git(repo, "show", "--no-patch", "--format=fuller", refs[-1])
         commit_summary += git(repo, "diff-tree", *COMMIT_DIFF_FLAGS, "--stat", *refs)
+    source_guard.require_no_secret_values("commit summary", commit_summary)
     parent_header = f"parent: {refs[0]}" if len(refs) == 2 else "parent: none (verified raw root)"
     text = "\n\n".join(
         [
@@ -3584,6 +3608,8 @@ def capture_evidence_file(repo: Path, raw_path: str, label: str) -> EvidenceFile
 
 def capture_evidence_inputs(args: argparse.Namespace, repo: Path) -> EvidenceInputs:
     chunks = list(args.prompt or [])
+    for chunk in chunks:
+        source_guard.require_no_secret_values("--prompt", chunk)
     datasets = []
     files = []
     captured: dict[tuple[str, str], EvidenceFile] = {}
@@ -7459,8 +7485,8 @@ def run_reviewer(
     with PreparationProgress("evidence verification"):
         verify_evidence(repo, evidence or [])
         verify_mixed_sources(repo, mixed)
-    # Scanner-free operation is intentional for enterprise compatibility.
-    # Preserve SKILL.md's "Intentional scanner-free policy" when changing this path.
+    # Captured inputs passed the lexical guard before partitioning.
+    # Recheck their existing owner identities before transmitting them.
     raw = run_engine(args, repo, outgoing)
     try:
         report = extract_json(raw)
