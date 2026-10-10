@@ -8,6 +8,7 @@ import binascii
 import bisect
 import functools
 import io
+import json
 import re
 import tokenize
 import unicodedata
@@ -5669,8 +5670,77 @@ def diff_section_source_contents(section: str) -> list[tuple[str | None, str]]:
             for rel, content in zip(paths, unified_diff_contents(hunk))]
 
 
+class JsonObjectMembers(tuple):
+    """Preserve every object member, including overwritten duplicate keys."""
+
+
+class JsonNumber(str):
+    """Retain numeric spelling so decoding cannot shorten credential literals."""
+
+
+def json_nonfinite_constant(value: str):
+    raise ValueError('nonfinite JSON number')
+
+
+def json_scalar_spelling(value: Any) -> str:
+    return str(value) if isinstance(value, JsonNumber) else json.dumps(value)
+
+
+def json_member_risk(key: str, value: Any, depth: int) -> bool:
+    if secret_text_risk(key):
+        return True
+    prefix = json.dumps(key) + ': '
+    if SECRET_ASSIGNMENT_PREFIX_PATTERN.fullmatch(prefix):
+        # A credential-labelled container cannot prove a reference. Keep its
+        # literal data refused; ordinary members retain independent decoding.
+        if isinstance(value, (JsonObjectMembers, list)):
+            return True
+        if secret_text_risk(prefix + json_scalar_spelling(value)):
+            return True
+    return json_value_risk(value, depth + 1)
+
+
+def json_members_risk(value: JsonObjectMembers, depth: int) -> bool:
+    return any(json_member_risk(key, child, depth) for key, child in value)
+
+
+def json_list_risk(value: list, depth: int) -> bool:
+    return any(json_value_risk(child, depth + 1) for child in value)
+
+
+def json_value_risk(value: Any, depth: int = 0) -> bool:
+    if depth > 64:
+        return True
+    if isinstance(value, JsonObjectMembers):
+        return json_members_risk(value, depth)
+    if isinstance(value, list):
+        return json_list_risk(value, depth)
+    if isinstance(value, str):
+        return secret_text_risk(value)
+    return False
+
+
+def json_source_risk(text: str) -> bool:
+    try:
+        value = json.loads(text, object_pairs_hook=JsonObjectMembers,
+                           parse_constant=json_nonfinite_constant,
+                           parse_int=JsonNumber, parse_float=JsonNumber)
+    except RecursionError:
+        return True
+    except ValueError:
+        return secret_text_risk(text)
+    # Escaped quotes delimit data, not source tokens. Scan all decoded members
+    # independently so one safe field cannot hide another field's credential.
+    return json_value_risk(value)
+
+
 def require_safe_source(label: str, rel: str, text: str) -> None:
     require_no_secret_values("source path", rel)
+    if Path(rel).suffix == '.json':
+        if json_source_risk(text):
+            raise SystemExit('refusing to include secret-like content in review bundle; '
+                             f'clean or redact {label} before running autoreview')
+        return
     require_no_secret_values(
         label, text,
         javascript_dialect=javascript_review_dialect(rel),
