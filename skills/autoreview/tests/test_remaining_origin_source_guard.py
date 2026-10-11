@@ -128,5 +128,50 @@ class RemainingOriginGuardTests(unittest.TestCase):
         self.accept('def connect(' + 'password' + ': str = provided):\n    pass\n', 'entry.py')
         self.accept('def connect(*, ' + 'is_secret' + ': bool = False):\n    pass\n', 'entry.py')
 
+
+    def test_ambient_declaration_member_is_type_only_in_public_contract_text(self):
+        source = 'export declare const Schema: Namespace.Object<{\n    progressToken: Namespace.Optional<Namespace.Union<readonly [Namespace.String, Namespace.Number]>>;\n}>;\n'
+        for path in ('contract.txt', 'entry.d.ts'):
+            self.accept(source, path)
+
+    def test_ambient_declaration_exemption_cannot_hide_runtime_or_literal_values(self):
+        for source in (
+            'const value = {progressToken: Namespace.Optional};',
+            'export declare const Schema: Namespace.Object<{progressToken: Namespace.Optional<Namespace.String>; password = ' + repr(opaque()) + ';}>;',
+            'export declare const Schema: Namespace.Object<{progressToken: makeType(' + repr(opaque()) + ');}>;',
+            'export declare const Schema: Namespace.Object<{progressToken: ' + repr(opaque()) + ';}>;',
+            'export declare const Schema: Namespace.Object<{progressToken: Namespace.String;}> = ' + repr(opaque()) + ';',
+            '// export declare const Schema: Namespace.Object<{\nprogressToken: Namespace.Optional<Namespace.String>;\n}>;',
+            'export declare const Schema: Namespace.Object<{\nprogressToken: Namespace.Optional<Namespace.String>;\n',
+        ):
+            self.refuse(source, 'contract.txt')
+        self.refuse('export declare const Schema: Namespace.Object<{progressToken: Namespace.String;}>;\npassword = ' + repr(opaque()), 'contract.txt')
+
+
+    def test_ambient_generic_literals_and_fake_owners_stay_refused(self):
+        for expression in (
+            'Namespace.Optional<' + repr(opaque()) + '>',
+            'Namespace.Optional<Namespace.String | ' + repr(opaque()) + '>',
+        ):
+            source = 'export declare const Schema: Namespace.Object<{progressToken: ' + expression + ';}>;'
+            for wrapped in (source, '/* ' + source + ' */', repr(source), chr(96) + source + chr(96)):
+                self.refuse(wrapped, 'contract.txt')
+
+    def test_ambient_parser_budget_and_invalid_type_grant_no_partial_exemption(self):
+        for expression in (
+            'Namespace.Optional<Namespace.String,,Namespace.Other>',
+            'Namespace.Optional<>',
+            'Namespace.String Namespace.Other',
+            'Namespace.Optional<' * 33 + 'Namespace.String' + '>' * 33,
+            'Namespace.Optional<' + ' ' * 8192 + 'Namespace.String>',
+        ):
+            source = 'export declare const Schema: Namespace.Object<{progressToken: ' + expression + ';}>;'
+            self.refuse(source, 'contract.txt')
+
+
+    def test_ambient_owner_budget_includes_declaration_header(self):
+        source = 'export declare const ' + 'S' * 8192 + ': Namespace.Object<{progressToken: Namespace.Optional<Namespace.String>;}>;'
+        self.refuse(source, 'contract.txt')
+
 if __name__ == '__main__':
     unittest.main()

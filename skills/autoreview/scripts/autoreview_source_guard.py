@@ -3987,6 +3987,164 @@ def javascript_binding_code(text: str) -> str:
         cursor = end
     return "".join(masked)
 
+def typescript_ambient_type_tokens(text, start):
+    tokens, stack = [], []
+    cursor, limit = start, min(len(text), start + 8192)
+    pairs = {"<": ">", "[": "]", "{": "}"}
+    while cursor < limit:
+        item = typescript_ambient_type_token(text, cursor, limit)
+        if item is None:
+            return None
+        value, end = item
+        if value is not None:
+            tokens.append((value, cursor, end))
+            if not typescript_ambient_token_balance(value, stack, pairs):
+                return None
+            if value == ";" and not stack:
+                return tokens
+        cursor = end
+    return None
+
+
+def typescript_ambient_type_token(text, cursor, limit):
+    if text[cursor].isspace():
+        return None, cursor + 1
+    comment = javascript_comment_end(text, cursor)
+    if comment is not None:
+        return (None, comment) if comment <= limit else None
+    if text[cursor] in {"'", '"'}:
+        end = csharp_quoted_literal_end(text, cursor, verbatim=False, interpolated=False)
+        return (text[cursor:end], end) if end is not None and end <= limit else None
+    token = re.match(r"[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*|[<>{}\[\]:;,?&|]", text[cursor:limit])
+    return (token.group(), cursor + token.end()) if token is not None else None
+
+
+def typescript_ambient_token_balance(value, stack, pairs):
+    if value in pairs:
+        stack.append(pairs[value])
+        return len(stack) <= 32
+    if value in pairs.values():
+        return bool(stack) and stack.pop() == value
+    return True
+
+
+def typescript_type_reference_parse(tokens, cursor):
+    result = typescript_type_reference_atom(tokens, cursor)
+    if result is None:
+        return None
+    cursor, literal, members = result
+    while cursor < len(tokens) and tokens[cursor][0] in {"|", "&"}:
+        result = typescript_type_reference_atom(tokens, cursor + 1)
+        if result is None:
+            return None
+        cursor, next_literal, next_members = result
+        literal, members = literal or next_literal, members + next_members
+    return cursor, literal, members
+
+
+def typescript_type_reference_atom(tokens, cursor):
+    if cursor >= len(tokens):
+        return None
+    value = tokens[cursor][0]
+    if value == "readonly" and cursor + 1 < len(tokens) and tokens[cursor + 1][0] == "[":
+        return typescript_type_reference_list(tokens, cursor + 2, "]")
+    if value == "[":
+        return typescript_type_reference_list(tokens, cursor + 1, "]")
+    if value == "{":
+        return typescript_type_reference_object(tokens, cursor + 1)
+    return typescript_type_reference_named(tokens, cursor)
+
+
+def typescript_type_reference_named(tokens, cursor):
+    value = tokens[cursor][0]
+    literal = value.startswith(("'", '"'))
+    if not literal and re.fullmatch(r"[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*", value) is None:
+        return None
+    cursor, members = cursor + 1, []
+    if cursor < len(tokens) and tokens[cursor][0] == "<":
+        result = typescript_type_reference_list(tokens, cursor + 1, ">")
+        if result is None:
+            return None
+        cursor, child_literal, members = result
+        literal = literal or child_literal
+    while cursor + 1 < len(tokens) and [t[0] for t in tokens[cursor:cursor + 2]] == ["[", "]"]:
+        cursor += 2
+    return cursor, literal, members
+
+
+def typescript_type_reference_list(tokens, cursor, closer):
+    if cursor >= len(tokens) or (closer == ">" and tokens[cursor][0] == closer):
+        return None
+    literal, members = False, []
+    while cursor < len(tokens) and tokens[cursor][0] != closer:
+        result = typescript_type_reference_parse(tokens, cursor)
+        if result is None:
+            return None
+        cursor, child_literal, child_members = result
+        literal, members = literal or child_literal, members + child_members
+        if cursor < len(tokens) and tokens[cursor][0] == ",":
+            cursor += 1
+        elif cursor >= len(tokens) or tokens[cursor][0] != closer:
+            return None
+    return (cursor + 1, literal, members) if cursor < len(tokens) else None
+
+
+def typescript_type_reference_member(tokens, cursor):
+    key, begin, _ = tokens[cursor]
+    if not key.startswith(("'", '"')) and re.fullmatch(r"[A-Za-z_$][\w$]*", key) is None:
+        return None
+    cursor += 1
+    if cursor < len(tokens) and tokens[cursor][0] == "?":
+        cursor += 1
+    if cursor >= len(tokens) or tokens[cursor][0] != ":":
+        return None
+    end = tokens[cursor][2]
+    result = typescript_type_reference_parse(tokens, cursor + 1)
+    if result is None:
+        return None
+    cursor, literal, members = result
+    if not literal and not key.startswith(("'", '"')):
+        members = members + [(begin, end)]
+    return cursor, literal, members
+
+
+def typescript_type_reference_object(tokens, cursor):
+    literal, members = False, []
+    while cursor < len(tokens) and tokens[cursor][0] != "}":
+        result = typescript_type_reference_member(tokens, cursor)
+        if result is None:
+            return None
+        cursor, child_literal, child_members = result
+        literal, members = literal or child_literal, members + child_members
+        if cursor < len(tokens) and tokens[cursor][0] in {";", ","}:
+            cursor += 1
+        elif cursor >= len(tokens) or tokens[cursor][0] != "}":
+            return None
+    return (cursor + 1, literal, members) if cursor < len(tokens) else None
+
+
+def typescript_ambient_member_reference_ranges(text):
+    # Complete ambient owners have no initializers. Parse raw literal types and
+    # buffer only literal-free member prefixes until the whole owner succeeds.
+    code = javascript_binding_code(text)
+    declaration = re.compile(r"(?m)^[ \t]*(?:export[ \t]+)?declare[ \t]+(?:const|let|var)[ \t]+"
+                             r"[A-Za-z_$][\w$]*[ \t]*:[ \t]*")
+    ranges = []
+    for match in declaration.finditer(code):
+        ranges.extend(typescript_ambient_declaration_members(text, code, match))
+    return tuple(ranges)
+
+
+def typescript_ambient_declaration_members(text, code, match):
+    if text[match.start():match.end()] != match.group():
+        return []
+    tokens = typescript_ambient_type_tokens(text, match.end())
+    result = typescript_type_reference_parse(tokens, 0) if tokens else None
+    if result is None or result[0] != len(tokens) - 1 or tokens[-1][0] != ";" or tokens[-1][2] - match.start() > 8192:
+        return []
+    return [(start, end) for start, end in result[2] if text[start:end] == code[start:end]]
+
+
 def typescript_type_reference_ranges(text: str, dialect: str | None) -> tuple[tuple[int, int], ...]:
     if dialect != "typescript":
         return ()
@@ -8471,6 +8629,7 @@ def secret_text_risk(
     safe_assignment_ranges += shell_environment_selector_ranges(text)
     safe_assignment_ranges += documentation_comment_reference_ranges(text)
     safe_assignment_ranges += typescript_type_reference_ranges(text, javascript_dialect)
+    safe_assignment_ranges += typescript_ambient_member_reference_ranges(text)
 
     if compose_source:
         safe_assignment_ranges += compose_required_uri_variable_ranges(text, uri_authorities)
