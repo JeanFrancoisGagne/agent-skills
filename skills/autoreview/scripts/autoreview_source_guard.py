@@ -3,10 +3,14 @@ from __future__ import annotations
 # Captured text is checked before any review engine receives it.
 # The lexical owner has no Git, file, capture, or engine dependencies.
 import ast
+import contextvars
+import contextlib
+import posixpath
 import base64
 import binascii
 import bisect
 import functools
+import hashlib
 import io
 import json
 import re
@@ -1474,7 +1478,20 @@ def uri_authority_ranges(
             contexts.get(match.start()),
         )
         for match in matches
+        if not uri_metasyntax_comment_reference(text, match, contexts.get(match.start()))
     )
+
+
+def uri_metasyntax_comment_reference(text, match, context) -> bool:
+    # This fixed notation names grammar slots, not a network authority. Real
+    # schemes, hosts, string values and all other userinfo remain credential data.
+    notation = "scheme://" + "user:" + "pass@host"
+    if context is not None or text[match.start() - 1:match.start()] != chr(96):
+        return False
+    if not text.startswith(notation + chr(96), match.start()):
+        return False
+    prefix = text[text.rfind("\n", 0, match.start()) + 1:match.start() - 1]
+    return prefix.lstrip().startswith("//")
 
 def credentialed_uri_risk(
     text: str,
@@ -2361,9 +2378,7 @@ def secret_literal_risk(
     *,
     javascript_dialect: str | None = None,
 ) -> bool:
-    if credentialed_uri_risk(expression) or basic_authorization_risk(expression) or any(
-        pattern.search(expression) for pattern in SECRET_VALUE_PATTERNS
-    ):
+    if credentialed_uri_risk(expression) or basic_authorization_risk(expression) or captured_fixture_secret_value_risk(expression):
         return True
     value_pattern = re.compile(
         rf'"(?P<double>[^"\r\n]{{{minimum_length},}})"'
@@ -2400,6 +2415,7 @@ def secret_literal_risk(
                 continue
         return True
     return False
+
 
 def javascript_numeric_fallback_risk(expression: str, dialect: str | None) -> bool:
     if dialect is None:
@@ -2448,8 +2464,378 @@ def role_marked_synthetic_secret_fixture(value: str, normalized_key: str) -> boo
     return marker is not None and marker.group("prefix") in SYNTHETIC_SECRET_PREFIXES
 
 
+
+
+_CAPTURED_SOURCES = contextvars.ContextVar('captured_source_inputs', default=())
+_CAPTURED_SOURCE_PATH = contextvars.ContextVar('captured_source_path', default=None)
+
+
+@contextlib.contextmanager
+def captured_source_context(records):
+    # Only the capture owner supplies complete frozen files. No caller flags,
+    # environment, live reads or precomputed declarations enter this context.
+    sources = {}
+    for path, text in records:
+        path = str(PurePosixPath(path.replace('\\', '/')))
+        if path in sources and sources[path] != text:
+            raise SystemExit('conflicting captured source inputs')
+        sources[path] = text
+    token = _CAPTURED_SOURCES.set(tuple(sorted(sources.items())))
+    try:
+        yield
+    finally:
+        _CAPTURED_SOURCES.reset(token)
+
+
+def javascript_captured_module_path(current, specifier, sources):
+    if specifier.startswith('.'):
+        candidate = posixpath.normpath(posixpath.join(posixpath.dirname(current), specifier))
+        if candidate.startswith('../') or candidate.startswith('/'):
+            return None
+        paths = [candidate]
+        if candidate.endswith('.js'):
+            paths.append(candidate[:-3] + '.ts')
+        elif not PurePosixPath(candidate).suffix:
+            paths.extend(candidate + suffix for suffix in ('.ts', '.js'))
+        found = [path for path in paths if path in sources]
+        return found[0] if len(found) == 1 else None
+    matches = []
+    for path, text in sources.items():
+        if PurePosixPath(path).name != 'tsconfig.json':
+            continue
+        try:
+            config = json.loads(text)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(config, dict):
+            continue
+        options = config.get('compilerOptions', {})
+        if not isinstance(options, dict) or options.get('baseUrl') or config.get('extends'):
+            continue
+        paths = options.get('paths', {})
+        if not isinstance(paths, dict):
+            continue
+        for pattern, targets in paths.items():
+            if not isinstance(pattern, str) or pattern.count('*') > 1:
+                continue
+            if not isinstance(targets, list) or len(targets) != 1 or not isinstance(targets[0], str):
+                continue
+            suffix = ''
+            if '*' in pattern:
+                before, after = pattern.split('*', 1)
+                if not specifier.startswith(before) or not specifier.endswith(after):
+                    continue
+                suffix = specifier[len(before):len(specifier) - len(after) if after else None]
+            elif pattern != specifier:
+                continue
+            target = targets[0].replace('*', suffix)
+            resolved = javascript_captured_module_path(path, target if target.startswith('.') else './' + target, sources)
+            if resolved:
+                matches.append(resolved)
+    return matches[0] if len(set(matches)) == 1 else None
+
+
+
+def javascript_captured_function(current, name, sources, depth=0):
+    if depth >= 8 or current not in sources:
+        return None
+    text = sources[current]
+    code = javascript_binding_code(text)
+    pairs = javascript_scope_pairs(code)
+    if pairs is None or javascript_binding_initializers(text, code, name):
+        return None
+    declarations = [match for match in re.finditer(r'\bfunction\s+' + re.escape(name) + r'(?![\w$])', code)
+                    if not any(code[start] == '{' and start < match.start() < end for start, end in pairs.items())]
+    if any(re.search(r'\basync\s*$', code[:match.start()]) for match in declarations):
+        return None
+    if len(declarations) == 1:
+        declaration = declarations[0]
+        if depth and not re.search(r'\bexport\s*$', code[:declaration.start()]):
+            return None
+        parts = javascript_local_function_parts(text, code, declaration)
+        return (current, name, parts) if parts else None
+    if declarations:
+        return None
+    bindings = []
+    pattern = r'(?<![\w$])(?:import|export)\s*\{([^}]+)\}\s*from\s*(["\u0027])([^"\u0027]+)\2'
+    for match in re.finditer(pattern, text):
+        # Quoted data cannot invent a module binding.
+        keyword = code[match.start():match.start() + 6]
+        if keyword not in {'import', 'export'} or (depth and keyword != 'export'):
+            continue
+        for field in match.group(1).split(','):
+            field = field.strip()
+            if field.startswith('type '):
+                continue
+            pair = re.fullmatch(r'([A-Za-z_$][\w$]*)(?:\s+as\s+([A-Za-z_$][\w$]*))?', field)
+            if pair and (pair.group(2) or pair.group(1)) == name:
+                path = javascript_captured_module_path(current, match.group(3), sources)
+                if path:
+                    bindings.append((path, pair.group(1)))
+    if len(bindings) != 1:
+        return None
+    path, original = bindings[0]
+    return javascript_captured_function(path, original, sources, depth + 1)
+
+
+def javascript_captured_return_summary(record):
+    if record is None:
+        return None
+    _, _, (parameters, body) = record
+    names = []
+    for parameter in split_top_level_call_arguments(parameters):
+        field = re.fullmatch(r'\s*([A-Za-z_$][\w$]*)\??\s*(?::[\s\S]+)?', parameter)
+        if field is None or '=' in parameter:
+            return None
+        names.append(field.group(1))
+    code = javascript_binding_code(body)
+    returned = re.match(r'\s*return\b', code)
+    if returned is None:
+        return None
+    expression = fallback_expression(body[returned.end():], typescript=True).strip()
+    remainder = body[returned.end():].strip()
+    if remainder not in {expression, expression + ';'}:
+        return None
+    # A leaf return may select or coalesce parameters. It cannot assign, call,
+    # construct, coerce, read a global or hide literal return bytes.
+    checked = re.fullmatch(r'typeof\s+([A-Za-z_$][\w$]*)\s*===\s*(["\u0027])(string|number|boolean)\2\s*\?\s*\1\s*:\s*(?:undefined|null)', expression)
+    if checked and checked.group(1) in names:
+        return ((checked.group(1),), True)
+    if javascript_expression_has_literal(expression):
+        return None
+    pieces = re.split(r'\?\?|\|\|', expression)
+    reference = r'[A-Za-z_$][\w$]*(?:(?:\?\.|\.)[A-Za-z_$][\w$]*)*'
+    if not all(re.fullmatch(reference, part.strip()) and part.strip().split('.')[0].rstrip('?') in names for part in pieces):
+        return None
+    if any(javascript_prototype_selector(part.strip()) for part in pieces):
+        return None
+    return (tuple(pieces), False)
+
+
+
+
+def javascript_captured_primitive_result(expression, text):
+    current = _CAPTURED_SOURCE_PATH.get()
+    sources = dict(_CAPTURED_SOURCES.get())
+    call = re.fullmatch(r'\s*([A-Za-z_$][\w$]*)\s*\([\s\S]*\)\s*', expression)
+    if not sources or current is None or call is None:
+        return False
+    code = javascript_binding_code(expression)
+    opening = code.find('(')
+    if javascript_balanced_binding_end(code, opening, '(', ')') != len(code.rstrip()):
+        return False
+    sources[current] = text
+    summary = javascript_captured_return_summary(javascript_captured_function(current, call.group(1), sources))
+    return summary is not None and summary[1]
+
+
+def javascript_captured_read_only_call(text, code, opening):
+    prefix = code[:opening].rstrip()
+    target = re.search(r'(?<![\w$.])([A-Za-z_$][\w$]*)$', prefix)
+    current = _CAPTURED_SOURCE_PATH.get()
+    if target is None or current is None:
+        return False
+    sources = dict(_CAPTURED_SOURCES.get())
+    if not sources:
+        return False
+    sources[current] = text
+    return javascript_captured_return_summary(javascript_captured_function(current, target.group(1), sources)) is not None
+
+
+def javascript_captured_import_origins(text, code, root):
+    current = _CAPTURED_SOURCE_PATH.get()
+    sources = dict(_CAPTURED_SOURCES.get())
+    if current is None or not sources or not re.search(r'(?<![\w$.])' + re.escape(root) + r'\s*\(', code):
+        return []
+    sources[current] = text
+    record = javascript_captured_function(current, root, sources)
+    if record is None or record[0] == current:
+        return []
+    module, original, _ = record
+    raw = sources[module]
+    # Follow whole-module local bindings before allowing a captured return.
+    # The original function, defaults and decoded literals remain in its scan.
+    token = _CAPTURED_SOURCE_PATH.set(module)
+    try:
+        if javascript_binding_literal_risk(raw, javascript_binding_code(raw), original):
+            return None
+    finally:
+        _CAPTURED_SOURCE_PATH.reset(token)
+    return [] if javascript_captured_return_summary(record) is not None else None
+
+
+_PYTHON_FIXTURE_PLACEHOLDERS = contextvars.ContextVar('python_fixture_placeholders', default=frozenset())
+
+
+
+def python_fixture_call_path(node):
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        base = python_fixture_call_path(node.value)
+        return base + '.' + node.attr if base else None
+    return None
+
+
+def python_public_placeholder_kind(value):
+    # Recorded data needs an explicit public-fixture marker and short role labels.
+    # Opaque bytes, provider prefixes and constructed suffixes never match.
+    if not isinstance(value, str):
+        return None
+    matched = re.fullmatch(r'(?:recorded|dummy|example|fake|fixture|mock|sample|test)-(?:[a-z]{1,16}-){0,2}(token|key|password|secret)', value)
+    return matched.group(1) if matched else None
+
+
+def python_fixture_started_calls(method):
+    return [node.func.value for node in ast.walk(method)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and node.func.attr == 'start' and not node.args and not node.keywords
+            and isinstance(node.func.value, ast.Call)]
+
+
+def python_fixture_setup_values(setup):
+    calls = python_fixture_started_calls(setup)
+    blocked = {call.args[0].value: call.lineno for call in calls
+               if python_fixture_call_path(call.func) == 'patch' and len(call.args) == 1
+               and isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str)
+               and any(keyword.arg == 'side_effect' and isinstance(keyword.value, ast.Call)
+                       and python_fixture_call_path(keyword.value.func) == 'AssertionError'
+                       for keyword in call.keywords)}
+    cleanup = any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                  and node.func.attr == 'addCleanup' and len(node.args) == 1
+                  and python_fixture_call_path(node.args[0]) == 'patch.stopall'
+                  for node in ast.walk(setup))
+    if not cleanup or not {'socket.create_connection', 'urllib.request.urlopen'} <= blocked.keys():
+        return frozenset()
+    environment = set()
+    for call in calls:
+        if (python_fixture_call_path(call.func) == 'patch.dict' and len(call.args) == 2
+                and python_fixture_call_path(call.args[0]) == 'os.environ'
+                and isinstance(call.args[1], ast.Dict)):
+            for key, value in zip(call.args[1].keys, call.args[1].values):
+                if (isinstance(key, ast.Constant) and isinstance(key.value, str)
+                        and isinstance(value, ast.Constant) and python_public_placeholder_kind(value.value)
+                        and re.search(r'(?:^|_)' + python_public_placeholder_kind(value.value) + r'$', key.value, re.I)):
+                    environment.add((value.value, python_public_placeholder_kind(value.value), key, value))
+    for node in ast.walk(setup):
+        if not isinstance(node, ast.Call) or python_fixture_call_path(node.func) != 'httpx.AsyncClient' or node.args:
+            continue
+        options = {keyword.arg: keyword.value for keyword in node.keywords}
+        transport, url, headers = (options.get(key) for key in ('transport', 'base_url', 'headers'))
+        if (not isinstance(options.get('trust_env'), ast.Constant) or options['trust_env'].value is not False
+                or not isinstance(transport, ast.Call) or python_fixture_call_path(transport.func) != 'httpx.ASGITransport'
+                or transport.args or len(transport.keywords) != 1 or transport.keywords[0].arg != 'app'
+                or not isinstance(url, ast.Constant) or not isinstance(url.value, str) or not isinstance(headers, ast.Dict)
+                or any(line >= node.lineno for line in blocked.values())):
+            continue
+        parsed = urllib.parse.urlsplit(url.value)
+        if parsed.scheme not in {'http', 'https'} or not parsed.hostname or not parsed.hostname.endswith('.invalid') or parsed.username or parsed.password:
+            continue
+        for key, value in zip(headers.keys, headers.values):
+            if (isinstance(key, ast.Constant) and isinstance(key.value, str) and key.value.casefold() == 'authorization'
+                    and isinstance(value, ast.Constant) and isinstance(value.value, str) and value.value.startswith('Bearer ')
+                    and any(entry[:2] == (value.value[7:], 'token') for entry in environment)):
+                return frozenset((entry[2], entry[3]) for entry in environment) | {(key, value)}
+    return frozenset()
+
+
+
+def python_fixture_provider_values(method):
+    calls = python_fixture_started_calls(method)
+    local_callbacks = {node.name for node in method.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    receivers = {ast.dump(call.args[0], include_attributes=False) for call in calls
+                 if python_fixture_call_path(call.func) == 'patch.object' and len(call.args) == 3
+                 and isinstance(call.args[1], ast.Constant) and call.args[1].value == 'urlopen'
+                 and isinstance(call.args[2], ast.Name) and call.args[2].id in local_callbacks}
+    values = set()
+    for call in calls:
+        if (python_fixture_call_path(call.func) != 'patch.object' or len(call.args) != 3
+                or ast.dump(call.args[0], include_attributes=False) not in receivers
+                or not isinstance(call.args[1], ast.Constant) or not isinstance(call.args[1].value, str)
+                or not isinstance(call.args[2], ast.Constant)):
+            continue
+        kind = python_public_placeholder_kind(call.args[2].value)
+        if kind and re.search(r'(?:^|_)' + kind + r'$', call.args[1].value, re.I):
+            values.add((call.args[1], call.args[2]))
+    return frozenset(values)
+
+
+
+def python_captured_fixture_placeholders(text):
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError):
+        return frozenset()
+    modules = {alias.name for node in tree.body if isinstance(node, ast.Import)
+               for alias in node.names if alias.asname is None}
+    patch_import = any(isinstance(node, ast.ImportFrom) and node.module == 'unittest.mock'
+                       and any(alias.name == 'patch' and alias.asname is None for alias in node.names) for node in tree.body)
+    if not {'os', 'httpx', 'unittest'} <= modules or not patch_import:
+        return frozenset()
+    owners = {'os', 'httpx', 'unittest', 'patch', 'AssertionError'}
+    if any(isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)) and node.id in owners
+           or isinstance(node, ast.arg) and node.arg in owners for node in ast.walk(tree)):
+        return frozenset()
+    values = set()
+    for cls in tree.body:
+        if not isinstance(cls, ast.ClassDef) or not any(python_fixture_call_path(base) == 'unittest.IsolatedAsyncioTestCase' for base in cls.bases):
+            continue
+        setup = next((node for node in cls.body if isinstance(node, ast.AsyncFunctionDef) and node.name == 'asyncSetUp'), None)
+        if setup is None:
+            continue
+        environment = python_fixture_setup_values(setup)
+        if not environment:
+            continue
+        values.update(environment)
+        for method in cls.body:
+            if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                values.update(python_fixture_provider_values(method))
+    literals = []
+    for key, value in values:
+        begin = python_literal_source_position(text, value)
+        end_node = ast.Constant(lineno=value.end_lineno, col_offset=value.end_col_offset)
+        end = python_literal_source_position(text, end_node)
+        key_begin = python_literal_source_position(text, key)
+        if begin is None or end is None or key_begin is None or not isinstance(value.value, str):
+            return None
+        literals.append((begin, end, value.value, key_begin))
+    return (text, tuple(sorted(literals)))
+
+
+
+def captured_fixture_secret_value_risk(text):
+    # Approval belongs to the exact isolated-fixture literal occurrence.
+    # An equal value in another literal or decoded data receives no approval.
+    approved = _PYTHON_FIXTURE_PLACEHOLDERS.get()
+    literals = approved[1] if approved and approved[0] == text else ()
+    for pattern in SECRET_VALUE_PATTERNS:
+        for match in pattern.finditer(text):
+            bearer = re.fullmatch(r'(?i)bearer\s+([A-Za-z0-9._-]{20,})', match.group())
+            if bearer and any(begin <= match.start() and match.end() <= end and value == match.group()
+                              for begin, end, value, _ in literals):
+                continue
+            return True
+    return False
+
+
+def python_fixture_prefix_ranges(text):
+    approved = _PYTHON_FIXTURE_PLACEHOLDERS.get()
+    return tuple((key, begin) for begin, _, _, key in approved[1]) if approved and approved[0] == text else ()
+
+
+def python_fixture_literal_owned(text, context, payload):
+    approved = _PYTHON_FIXTURE_PLACEHOLDERS.get()
+    if not approved or approved[0] != text:
+        return False
+    quote, start = context
+    token = python_source_literal_token(text, context)
+    return token is not None and any(begin <= start < end and payload == value and text[begin:end] == token
+                                    for begin, end, value, _ in approved[1])
+
+
 def synthetic_secret_fixture(value: str, key: str) -> bool:
     normalized = value.casefold()
+    kind = re.split(r"[_-]", key.strip("\"'").casefold())[-1]
     if normalized in SECRET_PLACEHOLDER_VALUES:
         return True
     if len(normalized) > 80:
@@ -2469,7 +2855,10 @@ def synthetic_secret_fixture(value: str, key: str) -> bool:
             for prefix in SYNTHETIC_SECRET_PREFIXES),
         delimited_synthetic_secret_fixture(value, normalized_key),
         role_marked_synthetic_secret_fixture(normalized, normalized_key),
+        numbered_synthetic_secret_fixture(normalized, normalized_key),
+        field_kind_synthetic_secret_fixture(normalized, normalized_key),
     ))
+
 
 def safe_secret_assignment_suffix(
     text: str,
@@ -3594,7 +3983,7 @@ def javascript_binding_code(text: str) -> str:
         if end is None:
             cursor += 1
             continue
-        masked[cursor:end] = ["\n" if char == "\n" else " " for char in text[cursor:end]]
+        masked[cursor:end] = [char if char in "\r\n\u2028\u2029" else " " for char in text[cursor:end]]
         cursor = end
     return "".join(masked)
 
@@ -3666,6 +4055,15 @@ def javascript_destructured_initializer(
         return None
     return expression or None
 
+def javascript_destructuring_declares_root(binding, code, root) -> bool:
+    # Scope projection preserves public keys while renaming local bindings.
+    # A key spelling is not a declaration of that original variable.
+    names = javascript_object_binding_names(binding)
+    return root in names if names is not None else re.search(
+        r"(?<![\w$])" + re.escape(root) + r"(?![\w$])", code,
+    ) is not None
+
+
 @functools.lru_cache(maxsize=8)
 def javascript_destructured_binding_initializers(text: str, code: str, root: str) -> list[str] | None:
     declarations = re.finditer(r"\b(?P<kind>const|let|var)\s*(?P<opening>[{\[])", code)
@@ -3676,7 +4074,7 @@ def javascript_destructured_binding_initializers(text: str, code: str, root: str
         end = javascript_balanced_binding_end(code, start, code[start], closer)
         if end is None:
             return None
-        if not re.search(r"(?<![\w$])" + re.escape(root) + r"(?![\w$])", code[start:end]):
+        if not javascript_destructuring_declares_root(text[start:end], code[start:end], root):
             continue
         if declaration.group("kind") != "const":
             return None
@@ -3751,7 +4149,13 @@ def javascript_parameter_parts(code: str) -> list[str]:
 
 def javascript_pattern_bindings(binding: str, start: int) -> list[tuple[int, str]] | None:
     if javascript_object_binding_names(binding) is None:
-        return None
+        # Object-rest syntax establishes lexical names only. It does not prove
+        # the resulting carrier's values or permit its mutable escape.
+        fields = binding[1:-1].split(',') if binding.startswith('{') and binding.endswith('}') else []
+        if not fields or any(not re.fullmatch(r'\s*(?:[A-Za-z_$][\w$]*(?:\s*:\s*[A-Za-z_$][\w$]*)?|\.\.\.[A-Za-z_$][\w$]*)\s*', field) for field in fields):
+            return None
+        if any('...' in field for field in fields[:-1]):
+            return None
     values = []
     cursor = start + 1
     for field in binding[1:-1].split(","):
@@ -3762,11 +4166,21 @@ def javascript_pattern_bindings(binding: str, start: int) -> list[tuple[int, str
     return values
 
 
+
+def javascript_declared_function_scope(code, pairs, declaration):
+    # Generic type parameters are not invocation arguments. Reuse the bounded
+    # type owner so formal value parameters keep their lexical declarations.
+    opening = javascript_local_parameter_start(code, declaration.end())
+    if opening is None or code[opening:opening + 1] != "(":
+        return None
+    return javascript_named_function_scope(code, pairs, opening)
+
+
 def javascript_named_function_bindings(code: str, pairs: dict[int, int]) -> dict[int, tuple[int, str]] | None:
     bindings: dict[int, tuple[int, str]] = {}
-    declarations = re.finditer(r"\bfunction\s*\*?\s*(?P<name>[A-Za-z_$][\w$]*)?\s*\(", code)
+    declarations = re.finditer(r"\bfunction(?![\w$])\s*\*?\s*(?P<name>[A-Za-z_$][\w$]*)?", code)
     for declaration in declarations:
-        parts = javascript_named_function_scope(code, pairs, declaration.end() - 1)
+        parts = javascript_declared_function_scope(code, pairs, declaration)
         if parts is None:
             return None
         body, parameters = parts
@@ -3775,7 +4189,6 @@ def javascript_named_function_bindings(code: str, pairs: dict[int, int]) -> dict
             position = declaration.start("name")
             bindings[position] = (javascript_scope_owner(code, pairs, position), declaration.group("name"))
     return bindings
-
 
 def javascript_named_function_scope(code: str, pairs: dict[int, int], start: int) -> tuple[int, list[tuple[int, str]]] | None:
     end = pairs.get(start)
@@ -3819,24 +4232,108 @@ def javascript_parenthesized_parameters(code: str, endings: dict[int, int], clos
     return javascript_parameter_bindings(code, start + 1, closing - 1) if start is not None else None
 
 
-def javascript_scope_declarations(code: str, pairs: dict[int, int]) -> dict[int, tuple[int, str]] | None:
+def javascript_method_parameter_bindings(code, pairs):
+    bindings = {}
+    for start, end in pairs.items():
+        if code[start] != '(':
+            continue
+        name = re.search(r'(?<![\w$.])([A-Za-z_$][\w$]*)\s*$', code[:start])
+        if name is None or name.group(1) in {'if', 'for', 'while', 'switch', 'catch', 'with', 'function'}:
+            continue
+        before = code[:name.start()].rstrip()
+        if not before or before[-1] not in '{,;}':
+            continue
+        body = javascript_function_body_start(code, end)
+        if body is None or body not in pairs:
+            continue
+        parameters = javascript_parameter_bindings(code, start + 1, end - 1)
+        if parameters is None:
+            return None
+        bindings.update((position, (body, parameter)) for position, parameter in parameters)
+    return bindings
+
+
+def javascript_scope_declarations(code: str, pairs: dict[int, int], scopes: dict[int, int]) -> dict[int, tuple[int, str]] | None:
     named = javascript_named_function_bindings(code, pairs)
     arrows = javascript_arrow_parameter_bindings(code, pairs)
-    if named is None or arrows is None:
+    methods = javascript_method_parameter_bindings(code, pairs)
+    if named is None or arrows is None or methods is None:
         return None
-    declarations = named | arrows
+    declarations = named | arrows | methods
     pattern = re.finditer(r"\b(?:const|let)\s+(?P<name>[A-Za-z_$][\w$]*|\{)", code)
     for declaration in pattern:
-        names = javascript_lexical_declaration_bindings(code, pairs, declaration)
+        names = javascript_lexical_declaration_bindings(code, pairs, scopes, declaration)
         if names is None:
             return None
         declarations.update(names)
     return declarations
 
 
-def javascript_lexical_declaration_bindings(code: str, pairs: dict[int, int], declaration: re.Match) -> dict[int, tuple[int, str]] | None:
+
+
+def javascript_lexical_scope_owner(scopes, position):
+    return max((start for start, end in scopes.items() if start < position < end), default=-1)
+
+
+def javascript_loop_body_start(code, start):
+    prefix = re.match(r'\s*', code[start:]).group()
+    # Masked literals can hide the first body statement. A line boundary in
+    # this prefix prevents borrowing the next statement as the loop body.
+    if re.search(r'[\r\n\u2028\u2029]', prefix):
+        return None
+    return start + len(prefix)
+
+
+def javascript_loop_expression_end(code, pairs, body):
+    # Child delimiters own their internal lines and semicolons. An exposed
+    # line or enclosing closer prevents extending the loop into another scope.
+    end, terminator = next(((body + match.start() + 1, match.group())
+                            for match in re.finditer(r'[;\r\n\u2028\u2029})\]]', code[body:])
+                            if not javascript_code_iteration_enclosed(pairs, body, len(code), body + match.start())), (None, ''))
+    return end if terminator == ';' else None
+
+
+def javascript_loop_statement_end(code, pairs, start):
+    body = javascript_loop_body_start(code, start)
+    if body is None:
+        return None
+    if code[body:body + 1] == '{':
+        return pairs.get(body)
+    # Unsupported statements keep the complete unprojected origin graph.
+    # Only a proved body lifetime can separate same-named loop bindings.
+    if re.match(r'(?:if|for|while|switch|try|with|do)\b', code[body:]):
+        return None
+    return javascript_loop_expression_end(code, pairs, body)
+
+
+def javascript_lexical_scopes(code, pairs):
+    scopes = {start: end for start, end in pairs.items() if code[start] == '{'}
+    for loop in re.finditer(r'\bfor\s*(?:await\s*)?\(', code):
+        closing = pairs.get(loop.end() - 1)
+        if closing is None:
+            return None
+        end = javascript_loop_statement_end(code, pairs, closing)
+        if end is None:
+            return None
+        # The loop keyword owns header and body on one lexical lifetime. Balanced
+        # delimiter pairs stay separate for expression and parameter parsing.
+        scopes[loop.start()] = end
+    return scopes
+
+
+def javascript_declaration_context(code):
+    pairs = javascript_scope_pairs(code)
+    if pairs is None:
+        return None, None, None
+    scopes = javascript_lexical_scopes(code, pairs)
+    if scopes is None:
+        return pairs, None, None
+    return pairs, scopes, javascript_scope_declarations(code, pairs, scopes)
+
+
+def javascript_lexical_declaration_bindings(code: str, pairs: dict[int, int], scopes: dict[int, int], declaration: re.Match) -> dict[int, tuple[int, str]] | None:
     start = declaration.start("name")
-    owner = javascript_scope_owner(code, pairs, start)
+    owner = javascript_lexical_scope_owner(scopes, start)
     if code[start] != "{":
         return {start: (owner, declaration.group("name"))}
     end = pairs.get(start)
@@ -3844,18 +4341,26 @@ def javascript_lexical_declaration_bindings(code: str, pairs: dict[int, int], de
     return {position: (owner, name) for position, name in names} if names is not None else None
 
 
-def javascript_visible_scope_name(code: str, pairs: dict[int, int], names: dict[int, str], position: int) -> str | None:
-    owner = javascript_scope_owner(code, pairs, position)
+def javascript_visible_scope_name(code: str, scopes: dict[int, int], names: dict[int, str], position: int) -> str | None:
+    owner = javascript_lexical_scope_owner(scopes, position)
     while owner not in names and owner != -1:
-        owner = javascript_scope_owner(code, pairs, owner)
+        owner = javascript_lexical_scope_owner(scopes, owner)
     return names.get(owner)
+
+
+def javascript_graph_member_prefix(prefix) -> bool:
+    # A spread operand is a lexical binding, while a property name is not.
+    # Confusing these leaves same-name local values outside the origin graph.
+    return prefix.endswith(".") and not prefix.endswith("...")
 
 
 def javascript_graph_token_replacement(code: str, match: re.Match, name: str, declared: bool) -> str | None:
     prefix, suffix = code[:match.start()].rstrip(), code[match.end():].lstrip()
     if declared:
         return match.group() + ": " + name if javascript_graph_shorthand(prefix, suffix) else name
-    if prefix.endswith(".") or suffix.startswith(":"):
+    # Only object keys skip lexical projection. A ternary value before its
+    # colon must keep the scoped binding and every local credential origin.
+    if javascript_graph_member_prefix(prefix) or javascript_initializer_object_key(code, match):
         return None
     if javascript_graph_shorthand(prefix, suffix):
         return match.group() + ": " + name
@@ -3869,11 +4374,10 @@ def javascript_graph_shorthand(prefix: str, suffix: str) -> bool:
 @functools.lru_cache(maxsize=8)
 def javascript_scope_graph_replacements(text: str) -> tuple[tuple[int, int, str], ...] | None:
     code = javascript_binding_code(text)
-    pairs = javascript_scope_pairs(code)
-    declarations = javascript_scope_declarations(code, pairs) if pairs is not None else None
+    pairs, scopes, declarations = javascript_declaration_context(code)
     if declarations is None or "__guard_scope_" in code:
         return None
-    return javascript_graph_replacements(code, pairs, declarations, javascript_scope_collision_names(code, declarations))
+    return javascript_graph_replacements(code, scopes, declarations, javascript_scope_collision_names(code, declarations))
 
 
 def javascript_scope_collision_names(code: str, declarations: dict[int, tuple[int, str]]) -> dict[str, dict[int, str]]:
@@ -3887,21 +4391,21 @@ def javascript_scope_collision_names(code: str, declarations: dict[int, tuple[in
     return {name: owners for name, owners in names.items() if len(owners) > 1 and name not in excluded}
 
 
-def javascript_graph_replacements(code: str, pairs: dict[int, int], declarations, collisions) -> tuple[tuple[int, int, str], ...]:
+def javascript_graph_replacements(code: str, scopes: dict[int, int], declarations, collisions) -> tuple[tuple[int, int, str], ...]:
     replacements = []
     for match in re.finditer(r"[A-Za-z_$][\w$]*", code):
         owners = collisions.get(match.group())
         if owners is None:
             continue
-        replacement = javascript_scoped_token_replacement(code, pairs, declarations, owners, match)
+        replacement = javascript_scoped_token_replacement(code, scopes, declarations, owners, match)
         if replacement is not None:
             replacements.append((match.start(), match.end(), replacement))
     return tuple(replacements)
 
 
-def javascript_scoped_token_replacement(code: str, pairs, declarations, owners, match: re.Match) -> str | None:
+def javascript_scoped_token_replacement(code: str, scopes, declarations, owners, match: re.Match) -> str | None:
     declaration = declarations.get(match.start())
-    name = owners[declaration[0]] if declaration is not None else javascript_visible_scope_name(code, pairs, owners, match.start())
+    name = owners[declaration[0]] if declaration is not None else javascript_visible_scope_name(code, scopes, owners, match.start())
     return javascript_graph_token_replacement(code, match, name, declaration is not None) if name is not None else None
 
 
@@ -3918,6 +4422,20 @@ def javascript_scoped_reference_graph(text: str, start: int, value: str) -> tupl
     return text, selected + value[len(root):]
 
 
+
+def javascript_parameter_declared(code, root) -> bool:
+    # Actual function parameters establish references; spelling a name inside
+    # a string, type member or call does not. Defaults retain the origin checks.
+    pairs = javascript_scope_pairs(code)
+    if pairs is None:
+        return False
+    named = javascript_named_function_bindings(code, pairs)
+    arrows = javascript_arrow_parameter_bindings(code, pairs)
+    return named is not None and arrows is not None and any(
+        name == root for _, name in (named | arrows).values()
+    )
+
+
 def declared_javascript_secret_reference(text: str, start: int, value: str) -> bool:
     reference = re.fullmatch(URI_CREDENTIAL_REFERENCE_TEXT, value)
     if reference is None:
@@ -3926,13 +4444,22 @@ def declared_javascript_secret_reference(text: str, start: int, value: str) -> b
     root = re.match(r"[A-Za-z_$][A-Za-z0-9_$]*", value).group()
     if code[start : start + len(root)] != root:
         return False
+    source_text, source_value = text, value
     text, value = javascript_scoped_reference_graph(text, start, value)
     code = javascript_binding_code(text)
+    owned = javascript_code_symbol_expression(text, value)
+    if owned is None:
+        owned = javascript_code_parameter_occurrence(source_text, start, source_value)
+    if owned is not None:
+        return owned
     root = re.match(r"[A-Za-z_$][\w$]*", value).group()
     declared = re.search(r"\b(?:const|let|var)\s+" + re.escape(root) + r"(?![\w$])", code)
-    if declared is None and not javascript_destructured_binding_initializers(text, code, root):
+    if declared is None and not javascript_parameter_declared(code, root) and not javascript_destructured_binding_initializers(text, code, root):
         return False
     return not javascript_binding_literal_risk(text, code, value)
+
+
+
 
 def javascript_expression_has_literal(expression: str) -> bool:
     cursor = 0
@@ -3940,24 +4467,75 @@ def javascript_expression_has_literal(expression: str) -> bool:
         if expression[cursor] in {'"', "'", "`"}:
             return True
         end = javascript_noncode_end(expression, cursor)
+        # Comments carry no value. Regex patterns remain literal origins so
+        # masking them cannot exempt credential bytes produced by .source.
+        if end is not None and javascript_comment_end(expression, cursor) is None:
+            return True
         cursor = cursor + 1 if end is None else end
     # Numeric source bytes can construct credentials without a quote delimiter.
-    # Mask comments and regexes before checking literal token starts.
     return re.search(r"(?<![\w$])(?:[0-9]|\.[0-9])", javascript_binding_code(expression)) is not None
 
-def javascript_binding_initializers(text: str, code: str, root: str | None = None) -> list[str]:
-    name = re.escape(root) if root is not None else r"[A-Za-z_$][A-Za-z0-9_$]*"
-    assignments = re.finditer(
-        r"(?<![\w$?.])" + name
-        + r"\s*(?::[^=;\r\n]+)?(?:\?\?|\|\||&&|<<|>>>?|[+\-*/%&|^])?=(?!=|>)",
-        code,
-    )
+def javascript_initializer_annotation_complete(assignment) -> bool:
+    if ":" not in assignment:
+        return True
+    # An annotation cannot cross a parameter/body boundary to borrow a later
+    # assignment. Balanced inline types keep their existing initializer scan.
+    annotation = assignment.split(":", 1)[1].rsplit("=", 1)[0]
+    return javascript_scope_pairs(annotation) is not None
+
+
+def javascript_binding_assignment_end(code, cursor):
+    cursor += len(code[cursor:]) - len(code[cursor:].lstrip())
+    if code[cursor:cursor + 1] == ':':
+        cursor += 1
+        begin, needs_type = cursor, True
+        while cursor < len(code) and cursor - begin <= 8192:
+            cursor += len(code[cursor:]) - len(code[cursor:].lstrip())
+            if code[cursor:cursor + 1] == '=':
+                break
+            if cursor == len(code):
+                return None
+            end = javascript_type_token_end(code, cursor)
+            if end is None:
+                return None
+            needs_type = code[cursor] in '|&'
+            cursor = end
+        if needs_type:
+            return None
+    assignment = re.match(r'(?:\?\?|\|\||&&|<<|>>>?|[+\-*/%&|^])?=(?!=|>)', code[cursor:])
+    return cursor + assignment.end() if assignment else None
+
+
+@functools.lru_cache(maxsize=16)
+def javascript_binding_annotation_ranges(code):
+    pairs, scopes, declarations = javascript_declaration_context(code)
+    annotations = []
+    for position, (_, bound_name) in (declarations or {}).items():
+        tail = position + len(bound_name)
+        if code[tail:].lstrip().startswith(':'):
+            end = javascript_binding_assignment_end(code, tail)
+            if end is not None:
+                annotations.append((tail, end))
+    return tuple(annotations)
+
+def javascript_binding_initializers(text: str, code: str, root: str | None = None, *, preserve_callable: bool = False) -> list[str]:
+    # Balanced annotations establish the initializer boundary only. Their type
+    # names do not establish primitive contents or remove runtime literal bytes.
+    name = re.escape(root) if root is not None else r'[A-Za-z_$][A-Za-z0-9_$]*'
     values = []
-    for match in assignments:
-        expression = fallback_expression(text[match.end():], typescript=True)
-        origins = javascript_arrow_return_origins(expression)
+    annotations = javascript_binding_annotation_ranges(code)
+    for match in re.finditer(r'(?<![\w$.])' + name + r'(?![\w$])', code):
+        if any(begin <= match.start() < end for begin, end in annotations):
+            continue
+        end = javascript_binding_assignment_end(code, match.end())
+        if end is None:
+            continue
+        expression = fallback_expression(text[end:], typescript=True)
+        origins = None if preserve_callable else javascript_arrow_return_origins(expression)
         values.extend([expression] if origins is None else origins)
     return values
+
+
 
 
 def javascript_arrow_return_origins(expression: str) -> list[str] | None:
@@ -4034,39 +4612,169 @@ def javascript_local_return_origins(parameters: str, body: str) -> list[str]:
     return expressions
 
 def javascript_initializer_value_code(expression: str) -> str:
-    code = javascript_binding_code(expression)
+    code = javascript_binding_code(javascript_inline_type_text(expression))
     # Named TypeScript assertions describe types, not credential value origins.
-    # Keep the asserted expression and any following runtime operands in the graph.
-    return re.sub(
-        r"(?<![\w$?.])(?:as|satisfies)\s+[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*",
+    # Keep the asserted expression and every runtime member in the origin graph.
+    code = re.sub(
+        r"(?<![\w$?.])(?:as|satisfies)\s+[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*(?:\s*\|\s*[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)*",
         lambda match: " " * len(match.group()),
         code,
     )
+    return javascript_grouped_member_code(code)
+
+
+def javascript_grouped_member_code(code):
+    # A plain reference group has the same value as its inner reference.
+    # Normalize inner groups first so selected members remain visible at
+    # every nesting level; unresolved grouped writes still refuse below.
+    reference = r"[A-Za-z_$][\w$]*(?:(?:\?\.|\.)[A-Za-z_$][\w$]*)*"
+    pattern = re.compile(r"\([ \t]*(?P<root>" + reference + r")[ \t]*\)(?P<members>(?:[ \t]*(?:\?\.|\.)[ \t]*[A-Za-z_$][\w$]*)*)")
+    for _ in range(MAX_JAVASCRIPT_INITIALIZER_ROOTS):
+        normalized = pattern.sub(lambda match: javascript_grouped_member_replacement(code, match), code)
+        if normalized == code:
+            return code
+        code = normalized
+    return code
+
+def javascript_grouped_member_replacement(code, match):
+    prefix = code[:match.start()].rstrip()
+    callee = re.search(r"[A-Za-z_$][\w$]*$", prefix)
+    if prefix.endswith((")", "]")) or (callee is not None and callee.group() not in {"typeof", "return", "throw", "void", "delete", "await"}):
+        return match.group()
+    # Typed callees and function headers own their parameter parentheses.
+    # Keep them before group normalization so invocation/return scans survive.
+    if prefix.endswith('>'):
+        typed = re.finditer(r'[A-Za-z_$][\w$]*(?:(?:\?\.|\.)[A-Za-z_$][\w$]*)*\s*(?:\?\.\s*)?(?P<type><)', prefix)
+        for candidate in typed:
+            suffix = javascript_code_call_suffix(code, candidate.start('type'))
+            if suffix is not None and suffix[0] and suffix[1][1] == len(prefix):
+                return match.group()
+    offset = match.start("root") - match.start()
+    selected = match.group("root") + re.sub(r"[ \t]", "", match.group("members"))
+    return " " * offset + selected + " " * (len(match.group()) - offset - len(selected))
 
 def javascript_selected_object_field(field: str, member: str) -> str | None:
     key = re.match(r"\s*(?:([A-Za-z_$][\w$]*)|[\"']([A-Za-z_$][\w$]*)[\"'])\s*:", field)
     if key is not None:
-        return field[key.end():] if (key.group(1) or key.group(2)) == member else ""
+        return javascript_selected_named_field(field, key, member)
     shorthand = field.strip()
     if re.fullmatch(r"[A-Za-z_$][\w$]*", shorthand):
         return shorthand if shorthand == member else ""
     return None
 
+
+def javascript_selected_named_field(field, key, member):
+    name = key.group(1) or key.group(2)
+    # This literal changes the inherited member origin, not sibling data.
+    if name == "__proto__":
+        return None
+    return field[key.end():] if name == member else ""
+
 def javascript_selected_object_origins(expression: str, selection: list[str]) -> list[str] | None:
     values = []
     for field in split_top_level_call_arguments(expression.strip()[1:-1]):
-        if not field.strip():
-            continue
-        value = javascript_selected_object_field(field, selection[0])
-        if value is None:
-            return None
-        if not value:
-            continue
-        origins = javascript_selected_value_origins(value, selection[1:])
+        origins = javascript_selected_field_origins(field, selection)
         if origins is None:
             return None
         values.extend(origins)
-    return values
+    # Absence of an own field does not prove an inherited value harmless.
+    return values or None
+
+def javascript_selected_field_origins(field, selection):
+    field = field.strip()
+    if not field:
+        return []
+    if field.startswith("..."):
+        return javascript_selected_value_origins(field[3:], selection)
+    value = javascript_selected_object_field(field, selection[0])
+    if value is None:
+        return None
+    return javascript_selected_field_value_origins(value, selection)
+
+
+def javascript_selected_field_value_origins(value, selection):
+    # Selection must retain the field kind for the existing exact fixture
+    # contract. Arbitrary values and constructed suffixes keep their origins.
+    if not value:
+        return []
+    if len(selection) == 1 and javascript_selected_fixture_value(value, selection[0]):
+        return ["null"]
+    return javascript_selected_value_origins(value, selection[1:])
+
+
+def javascript_selected_fixture_value(value, field):
+    literal = re.fullmatch(r"\s*(?P<q>[\"'])(?P<value>[^\"'\r\n]*)(?P=q)\s*", value)
+    return literal is not None and synthetic_secret_fixture(literal.group("value"), field)
+
+def javascript_selected_collection_origins(expression, code, selection):
+    indexed = javascript_selected_index_reference(code, selection)
+    if indexed is not None:
+        return indexed
+    mapped = javascript_selected_map_parts(expression, code)
+    return javascript_selected_map_origins(mapped, selection) if mapped is not None else javascript_selected_call_origins(expression, code, selection)
+
+
+def javascript_selected_index_reference(code, selection):
+    match = re.fullmatch(r"(?P<root>" + URI_CREDENTIAL_REFERENCE_TEXT + r")\s*\[\s*(?P<index>[^\[\]]{1,256})\s*\]", code)
+    if match is None:
+        return None
+    index = match.group("index").strip()
+    length = re.escape(match.group("root")) + r"\.length(?:\s*[-+]\s*[01])?"
+    if re.fullmatch(r"[0-9]{1,4}|" + length, index) is None:
+        return None
+    return [match.group("root") + "." + ".".join(selection)]
+
+
+def javascript_selected_map_parts(expression, code):
+    match = re.match(r"(?P<root>" + URI_CREDENTIAL_REFERENCE_TEXT + r")\s*\.map\s*\(", code)
+    if match is None:
+        return None
+    opening = match.end() - 1
+    end = javascript_balanced_binding_end(code, opening, "(", ")")
+    if end is None or not javascript_reference_filter_suffix(expression[end:]):
+        return None
+    arrow = javascript_selected_map_arrow(expression[opening + 1:end - 1])
+    return (match.group("root"), arrow) if arrow is not None else None
+
+
+def javascript_selected_map_arrow(expression):
+    arrow = re.match(r"\s*\(\s*(?P<value>[A-Za-z_$][\w$]*)(?:\s*,\s*[A-Za-z_$][\w$]*)?\s*\)\s*=>", expression)
+    return (arrow.group("value"), expression[arrow.end():].strip()) if arrow is not None else None
+
+
+def javascript_selected_map_origins(parts, selection):
+    receiver, (parameter, body) = parts
+    origins = javascript_selected_value_origins(body, selection)
+    if origins is None:
+        return None
+    # Selected callback output carries its input origin. Literal returns remain
+    # in this list, so mapping and filtering cannot hide credential construction.
+    return [receiver] + [re.sub(r"(?<![\w$.])" + re.escape(parameter) + r"(?![\w$])", receiver, value) for value in origins]
+
+
+def javascript_reference_filter_suffix(suffix):
+    if not suffix.strip():
+        return True
+    match = re.fullmatch(r"\s*\.filter\s*\(([\s\S]*)\)\s*", suffix)
+    if match is None:
+        return False
+    expression = match.group(1)
+    arrow = re.match(r"\s*\(\s*\{\s*[A-Za-z_$][\w$]*(?:\s*:\s*[A-Za-z_$][\w$]*)?\s*\}\s*\)\s*=>", expression)
+    return arrow is not None and javascript_reference_filter_predicate(expression[arrow.end():])
+
+
+def javascript_reference_filter_predicate(expression):
+    normalized = javascript_length_comparison_text(javascript_typeof_selector_text(expression))
+    return not javascript_expression_has_literal(normalized) and re.fullmatch(r"[A-Za-z0-9_$\s.!=<>|&()]+", normalized) is not None and "=" not in re.sub(r"[!=<>]=+", "", normalized)
+
+
+def javascript_length_comparison_text(expression):
+    pattern = re.compile(r"(?P<ref>" + URI_CREDENTIAL_REFERENCE_TEXT + r"(?:\(\s*\))?\.length)\s*(?:[<>]=?|[!=]==?)\s*[01](?![\w.])")
+    code = javascript_binding_code(expression)
+    matches = [m for m in pattern.finditer(expression) if code[m.start('ref'):m.end('ref')] == m.group('ref')]
+    return mask_ranges(expression, tuple((m.end('ref'), m.end()) for m in matches))
+
+
 
 def javascript_selected_call_origins(expression: str, code: str, selection: list[str]) -> list[str] | None:
     call = re.match(r"(?:await\s+)?(?P<callee>" + URI_CREDENTIAL_REFERENCE_TEXT + r")\s*\(", code)
@@ -4079,21 +4787,32 @@ def javascript_selected_call_origins(expression: str, code: str, selection: list
     # Carry the selected result member to the local callee. Arguments remain
     # independent value inputs, so their literal/alias checks still run.
     return [call.group("callee").replace("?.", ".") + "." + ".".join(selection)] + \
-        split_top_level_call_arguments(expression[opening + 1:end - 1])
+        [argument for argument in split_top_level_call_arguments(expression[opening + 1:end - 1]) if argument.strip()]
 
-def javascript_selected_value_origins(expression: str, selection: list[str]) -> list[str] | None:
+def javascript_selected_value_origins(expression: str, selection: list[str], depth: int = 0) -> list[str] | None:
+    if depth >= MAX_JAVASCRIPT_INITIALIZER_ROOTS:
+        return None
     if not selection:
         return [expression]
     expression = expression.strip()
     code = javascript_initializer_value_code(expression).strip()
+    if code.startswith("(") and javascript_balanced_binding_end(code, 0, "(", ")") == len(code):
+        return javascript_selected_value_origins(expression[1:-1], selection, depth + 1)
+    nullable = javascript_selected_nullable_origins(expression, selection, depth)
+    return nullable if nullable is not None else javascript_selected_structured_origins(expression, code, selection)
+
+
+def javascript_selected_structured_origins(expression, code, selection) -> list[str] | None:
     if code.startswith("{") and javascript_balanced_binding_end(code, 0, "{", "}") == len(code):
-        return javascript_selected_object_origins(expression, selection)
+        return javascript_selected_object_origins(expression[:len(code)], selection)
+    indexed = javascript_selected_index_reference(code, selection)
+    if indexed is not None:
+        return indexed
     if re.fullmatch(URI_CREDENTIAL_REFERENCE_TEXT, code):
         return [code.replace("?.", ".") + "." + ".".join(selection)]
     conditional = javascript_conditional_value_origins(expression, selection)
-    if conditional is not None:
-        return conditional
-    return javascript_selected_call_origins(expression, code, selection)
+    return conditional if conditional is not None else javascript_selected_collection_origins(expression, code, selection)
+
 
 
 def javascript_conditional_delimiters(code: str) -> tuple[int, int] | None:
@@ -4140,14 +4859,23 @@ def javascript_conditional_marker(code: str, cursor: int) -> str | None:
     return ":" if code[cursor] == ":" else None
 
 
+def javascript_selected_numeric_comparison(condition):
+    # A comparison returns Boolean, so its operand cannot become selected bytes.
+    # Only closed numeric comparisons qualify; literal value branches stay intact.
+    reference = URI_CREDENTIAL_REFERENCE_TEXT
+    return re.fullmatch(r'\s*' + reference + r'\s*(?:===|!==|==|!=|<=|>=|<|>)\s*[+-]?[0-9]+(?:\.[0-9]+)?\s*', condition) is not None
+
+
 def javascript_conditional_value_origins(expression: str, selection: list[str]) -> list[str] | None:
+    expression = javascript_inline_type_text(expression)
     code = javascript_binding_code(expression)
     delimiters = javascript_conditional_delimiters(code)
     if delimiters is None:
         return None
     question, colon = delimiters
     condition = expression[:question].strip()
-    if re.fullmatch(URI_CREDENTIAL_REFERENCE_TEXT, condition) is None:
+    condition = "false" if javascript_selected_numeric_comparison(condition) else javascript_length_comparison_text(javascript_metadata_comparison_text(javascript_typeof_selector_text(condition)))
+    if javascript_expression_has_literal(condition):
         return None
     values = [condition]
     for branch in (expression[question + 1:colon], expression[colon + 1:]):
@@ -4160,7 +4888,10 @@ def javascript_conditional_value_origins(expression: str, selection: list[str]) 
 def javascript_binding_value_origins(text: str, code: str, reference: str) -> list[str] | None:
     parts = re.findall(r"[A-Za-z_$][\w$]*|[0-9]+", reference)
     root, selection = parts[0], parts[1:]
-    if len(parts) > MAX_JAVASCRIPT_INITIALIZER_ROOTS or javascript_unsupported_binding_origin(text, code, root):
+    if len(parts) > MAX_JAVASCRIPT_INITIALIZER_ROOTS or (
+        javascript_selected_mutation_risk(text, code, parts) if selection
+        else javascript_unsupported_binding_origin(text, code, root)
+    ):
         return None
     return javascript_binding_selected_origins(text, code, root, selection, parts)
 
@@ -4182,20 +4913,25 @@ def javascript_binding_selected_origins(text, code, root, selection, parts) -> l
 
 @functools.lru_cache(maxsize=8)
 def javascript_unshadowed_undefined(code: str) -> bool:
-    pairs = javascript_scope_pairs(code)
-    declarations = javascript_scope_declarations(code, pairs) if pairs is not None else None
+    pairs, scopes, declarations = javascript_declaration_context(code)
     if declarations is None or re.search(r"\bvar\s+undefined(?![\w$])", code):
         return False
     # The builtin absence value has no initializer. Type unions such as
     # `value: Type | undefined = ...` do not assign to this identifier.
     return not any(name == "undefined" for _, name in declarations.values())
 
-@functools.lru_cache(maxsize=8)
-def javascript_binding_alias_edges(text: str, code: str) -> dict[str, set[str]]:
-    assignments = re.finditer(
-        r"(?<![\w$?.])(?P<alias>[A-Za-z_$][\w$]*)\s*(?::[^=;\r\n]+)?"
+def javascript_alias_assignments(code):
+    # Declaration and later assignments establish the same alias relation.
+    # Keep compact ternary roots visible and retain the existing operators.
+    return re.finditer(
+        r"(?<![\w$.])(?P<alias>[A-Za-z_$][\w$]*)\s*(?::[^=;\r\n]+)?"
         + r"(?:\?\?|\|\||&&|<<|>>>?|[+\-*/%&|^])?=(?!=|>)", code,
     )
+
+
+@functools.lru_cache(maxsize=8)
+def javascript_binding_alias_edges(text: str, code: str) -> dict[str, set[str]]:
+    assignments = javascript_alias_assignments(code)
     edges: dict[str, set[str]] = {}
     for assignment in assignments:
         expression = fallback_expression(text[assignment.end():], typescript=True)
@@ -4210,16 +4946,30 @@ def javascript_binding_alias_edges(text: str, code: str) -> dict[str, set[str]]:
     return edges
 
 def javascript_expression_uses_root(expression: str, root: str) -> bool:
+    if root not in expression:
+        return False
     code = javascript_initializer_value_code(expression)
+    pairs, scopes, declarations = javascript_declaration_context(code)
+    if declarations is None:
+        return True
+    owned = [(position, owner) for position, (owner, name) in declarations.items() if name == root]
     references = re.finditer(
-        r"(?<![\w$?.])(?:[.]{3})?(?P<reference>" + re.escape(root) + r"(?![\w$])"
+        r"(?<![\w$.])(?:[.]{3})?(?P<reference>" + re.escape(root) + r"(?![\w$])"
         r"(?:(?:\?\.|\.)[A-Za-z_$][A-Za-z0-9_$]*)*)", code,
     )
-    # Bare call names do not carry receivers. Spread operands and member calls do.
-    # Keep their value roots so an unproved alias initializer reaches refusal.
-    return any(not javascript_initializer_object_key(code, reference)
-               and (reference.group("reference") != root or re.match(r"\s*\(", code[reference.end():]) is None)
-               for reference in references)
+    for reference in references:
+        # Parameters created by an enclosing method are not captured outer inputs.
+        # Free references and unresolved scopes still carry the mutable root.
+        if any(reference.start() == position or owner < reference.start() < scopes.get(owner, -1)
+               for position, owner in owned):
+            continue
+        if not javascript_initializer_object_key(code, reference) and (
+            reference.group('reference') != root or re.match(r'\s*\(', code[reference.end():]) is None
+        ):
+            return True
+    return False
+
+
 
 
 def javascript_possible_destructured_alias_names(
@@ -4284,21 +5034,23 @@ def javascript_ignorable_alias(text, code, alias, edges, aliases) -> bool:
 
 
 def javascript_member_write_expressions(text, code, alias) -> list[str] | None:
+    pairs = javascript_scope_pairs(code)
     values = []
-    references = re.finditer(r"(?<![\w$?.])" + re.escape(alias) + r"(?![\w$])", code)
+    references = re.finditer(r"(?<![\w$.])" + re.escape(alias) + r"(?![\w$])", code)
     for reference in references:
-        value = javascript_member_write_expression(text, code, reference.end())
+        value = javascript_member_write_expression(text, code, reference.end(), pairs)
         if value is None:
             return None
         values.extend(value)
     return values
 
-
-def javascript_member_write_expression(text, code, start: int) -> list[str] | None:
+def javascript_member_write_expression(text, code, start: int, pairs) -> list[str] | None:
     members = javascript_mutation_members(code, start)
     if members is None:
         return None
     end, computed = members
+    if javascript_unresolved_grouped_write(code, pairs, end):
+        return None
     assignment = re.match(r"\s*(?:\?\?|\|\||&&|<<|>>>?|[+\-*/%&|^])?=(?!=|>)", code[end:])
     if end == start or assignment is None:
         return []
@@ -4399,7 +5151,7 @@ def javascript_alias_write_risk(code: str, start: int, alias: str, original: str
     return re.match(r"\s*(?:\?\?|\|\||&&|<<|>>>?|[+\-*/%&|^])?=(?!=|>)", code[end:]) is not None
 
 def javascript_object_mutation_risk(code: str, alias: str) -> bool:
-    operations = re.finditer(r"(?<![\w$?.])(?:Object|Reflect)(?![\w$])", code)
+    operations = re.finditer(r"(?<![\w$.])(?:Object|Reflect)(?![\w$])", code)
     for operation in operations:
         members = javascript_mutation_members(code, operation.end())
         if members is None:
@@ -4412,7 +5164,7 @@ def javascript_object_mutation_risk(code: str, alias: str) -> bool:
     return False
 
 def javascript_alias_mutation_risk(code: str, alias: str, original: str) -> bool:
-    references = re.finditer(r"(?<![\w$?.])" + re.escape(alias) + r"(?![\w$])", code)
+    references = re.finditer(r"(?<![\w$.])" + re.escape(alias) + r"(?![\w$])", code)
     # An object operation or a write through another binding can change the
     # returned member without changing its initializer. Refuse unproved origins.
     return any(javascript_alias_write_risk(code, reference.end(), alias, original)
@@ -4449,11 +5201,20 @@ def javascript_selected_expressions(expressions: list[str], selection: list[str]
         values.extend(origins)
     return values
 
+def javascript_local_parameter_start(code: str, cursor: int) -> int | None:
+    # Generic type parameters precede the value parameters. Reuse the bounded
+    # type owner; defaults and returned values still come from original source.
+    cursor += len(code[cursor:]) - len(code[cursor:].lstrip())
+    if code[cursor:cursor + 1] == "<":
+        return javascript_type_token_end(code, cursor)
+    return cursor
+
 def javascript_local_function_parts(text: str, code: str, match: re.Match) -> tuple[str, str] | None:
-    parameters = re.match(r"\s*\(", code[match.end():])
+    cursor = javascript_local_parameter_start(code, match.end())
+    parameters = re.match(r"\s*\(", code[cursor:]) if cursor is not None else None
     if parameters is None:
         return None
-    start = match.end() + parameters.end() - 1
+    start = cursor + parameters.end() - 1
     end = javascript_balanced_binding_end(code, start, "(", ")")
     if end is None:
         return None
@@ -4476,16 +5237,18 @@ def javascript_local_function_origins(text: str, code: str, root: str) -> list[s
         if parts is None:
             return None
         expressions.extend(javascript_local_return_origins(*parts))
-    return expressions
+    return expressions if expressions else javascript_captured_import_origins(text, code, root)
+
 
 def javascript_initializer_object_key(code: str, match: re.Match) -> bool:
     return code[:match.start()].rstrip().endswith(("{", ",")) and code[match.end():].lstrip().startswith(":")
 
 def javascript_initializer_references(expression: str) -> set[str]:
     code = javascript_initializer_value_code(expression)
-    # Spread operands are value roots; member names retain their value selection.
+    # A ternary question mark starts a value branch. A dot still separates
+    # member suffixes; spread operands retain their complete value selection.
     roots = re.finditer(
-        r"(?<![\w$?.])(?:\.\.\.)?(?P<root>[A-Za-z_$][A-Za-z0-9_$]*"
+        r"(?<![\w$.])(?:\.\.\.)?(?P<root>[A-Za-z_$][A-Za-z0-9_$]*"
         r"(?:(?:\?\.|\.)[A-Za-z_$][A-Za-z0-9_$]*)*)(?![\w$])", code,
     )
     return {match.group("root").replace("?.", ".") for match in roots
@@ -4497,11 +5260,1858 @@ def javascript_binding_links(text: str, code: str, root: str, checked_count: int
     expressions = javascript_binding_value_origins(text, code, root)
     if expressions is None:
         return None
-    return javascript_binding_proven_references(text, code, expressions)
+    return javascript_binding_proven_references(text, code, expressions, owner=root)
 
 
-def javascript_binding_proven_references(text, code, expressions) -> set[str] | None:
-    expressions = [expression for expression in expressions if not javascript_imported_entropy_origin(text, code, expression)]
+
+
+
+def javascript_declared_kind_comparison_text(text, expression) -> str:
+    # A named Kind return type and matching resolver declaration establish a
+    # control selector binding. Keep longer literal values and suffixes scanned.
+    pattern = re.compile(r"(?P<ref>[A-Za-z_$][\w$]*)\s*===\s*([\"'])[a-z]{3,7}\2")
+    code = javascript_binding_code(text)
+    spans = [match.span() for match in pattern.finditer(expression)
+             if javascript_declared_kind_selector(text, code, match.group("ref"))]
+    return javascript_selector_literal_mask(expression, spans)
+
+
+def javascript_declared_kind_selector(text, code, root) -> bool:
+    declaration = re.compile(r"\bconst\s+" + re.escape(root) + r"\s*=\s*(?P<callee>[A-Za-z_$][\w$]*)\s*\(")
+    for match in declaration.finditer(code):
+        callee = match.group("callee")
+        function = re.compile(r"\bfunction\s+" + re.escape(callee) + r"\s*\(")
+        for named in function.finditer(code):
+            end = javascript_balanced_binding_end(code, named.end() - 1, "(", ")")
+            kind = root[:1].upper() + root[1:] + "Kind"
+            if end is not None and re.match(r"\s*:\s*" + re.escape(kind) + r"\s*\{", code[end:]):
+                return True
+    return False
+
+
+def javascript_selected_nullable_origins(expression, selection, depth) -> list[str] | None:
+    code = javascript_initializer_value_code(expression)
+    pairs = javascript_scope_pairs(code)
+    if pairs is None:
+        return None
+    cursor = 0
+    while cursor < len(code):
+        if cursor in pairs:
+            cursor = pairs[cursor]
+            continue
+        if code[cursor:cursor + 2] in {"??", "||"}:
+            return javascript_selected_branch_origins(expression[:cursor], expression[cursor + 2:], selection, depth)
+        cursor += 1
+    return None
+
+
+def javascript_selected_branch_origins(left, right, selection, depth) -> list[str] | None:
+    left_values = javascript_selected_value_origins(left, selection, depth + 1)
+    right_values = javascript_selected_value_origins(right, selection, depth + 1)
+    return None if left_values is None or right_values is None else left_values + right_values
+
+
+
+def javascript_conditional_colon_ranges(text: str) -> tuple[tuple[int, int], ...]:
+    # A quoted ternary branch is not an object credential key. Object depth
+    # keeps its property colons separate from the surrounding conditional.
+    code = javascript_binding_code(text)
+    colons = javascript_conditional_colon_positions(code)
+    return tuple(match.span() for match in SECRET_ASSIGNMENT_PREFIX_PATTERN.finditer(text)
+                 if javascript_quoted_conditional_key(match, colons))
+
+
+def javascript_quoted_conditional_key(match, colons) -> bool:
+    return match.group().lstrip().startswith(('"', "'")) and match.start() + match.group().rfind(":") in colons
+
+
+def javascript_conditional_colon_positions(code) -> set[int]:
+    depth = 0
+    questions = []
+    colons = set()
+    for cursor, char in enumerate(code):
+        depth += int(char in "([{") - int(char in ")]}")
+        if javascript_conditional_marker(code, cursor) == "?":
+            questions.append(depth)
+        elif char == ":" and questions and questions[-1] == depth:
+            questions.pop()
+            colons.add(cursor)
+    return colons
+
+
+
+def field_kind_synthetic_secret_fixture(value: str, normalized_key: str) -> bool:
+    kind = normalized_key.rsplit("-", 1)[-1]
+    return kind in {"key", "token", "secret", "password", "credential", "credentials"} and any(
+        value == f"{prefix}-{kind}" for prefix in SYNTHETIC_SECRET_PREFIXES
+    )
+
+
+def numbered_synthetic_secret_fixture(value: str, normalized_key: str) -> bool:
+    # The public fixture count is exact. An arbitrary numeric or opaque suffix
+    # is credential data and cannot use this allowance.
+    marker = re.fullmatch(r"(?P<prefix>[a-z]+)-(?:[a-z]{1,16}-)?"
+                          + re.escape(normalized_key.rsplit("-", 1)[-1]) + r"-1234567890", value)
+    return marker is not None and marker.group("prefix") in SYNTHETIC_SECRET_PREFIXES
+
+
+def javascript_fixture_origin_text(expression) -> str:
+    spans = []
+    for match in SECRET_ASSIGNMENT_PATTERN.finditer(expression):
+        value = match.group("double_value") or match.group("single_value")
+        key = re.split(r"\s*[:=]\s*", match.group(), maxsplit=1)[0]
+        if value is not None and synthetic_secret_fixture(value, key) and safe_secret_assignment_suffix(expression, match.end(), javascript_dialect="typescript"):
+            spans.append(match.span())
+    return javascript_selector_literal_mask(expression, spans)
+
+
+def javascript_selected_mutation_risk(text, code, parts) -> bool:
+    # Selected members ignore sibling metadata writes, but whole replacements,
+    # computed writes and Object/Reflect operations still need a proved origin.
+    code = javascript_initializer_value_code(code)
+    aliases = javascript_selected_alias_paths(text, code, parts)
+    if javascript_selected_mutation_context_risk(text, code, aliases):
+        return True
+    expressions = []
+    for alias, selection in aliases.items():
+        if javascript_object_mutation_risk(code, alias):
+            return True
+        values = javascript_selected_alias_writes(text, code, alias, selection)
+        if values is None:
+            return True
+        expressions.extend(values)
+    return javascript_mutation_value_literal_risk(text, code, expressions)
+
+
+def javascript_selected_mutation_context_risk(text, code, aliases):
+    return aliases is None or javascript_prototype_writes(text, code, aliases) or javascript_selected_argument_escape(text, aliases)
+
+
+def javascript_selected_argument_escape(text, aliases):
+    # An unproved callee can mutate a receiver or any argument carrying the
+    # selected object. Selected metadata cannot prove those uses harmless.
+    code, _, _, _, context = javascript_prototype_context(text)
+    if context is None:
+        return True
+    return any(javascript_selected_alias_argument_escape(text, code, context, alias, selection)
+               for alias, selection in aliases.items())
+
+def javascript_selected_alias_argument_escape(text, code, context, alias, selection):
+    _, declarations, _, templates = context
+    references = re.compile(r"(?<![\w$])" + re.escape(alias) + r"(?![\w$])")
+    # Template masking preserves public names, while code binds local aliases.
+    # Reuse the selector owner so a scoped mutable input cannot escape here.
+    template_references = javascript_selector_use_pattern(alias)
+    if any(template_references.search(template) for template in templates):
+        return True
+    for reference in references.finditer(code):
+        if javascript_selected_argument_nonvalue(code, reference, declarations):
+            continue
+        if javascript_selected_reference_call_escape(text, code, context, reference, selection):
+            return True
+    return False
+
+def javascript_selected_argument_nonvalue(code, reference, declarations):
+    return reference.start() in declarations or javascript_graph_member_prefix(code[:reference.start()].rstrip()) or javascript_initializer_object_key(code, reference)
+
+
+def javascript_selected_argument_receiver(code, start, selection):
+    members = javascript_mutation_members(code, start)
+    if members is None or selection is None:
+        return True
+    end, computed = members
+    path = re.findall(r"[A-Za-z_$][\w$]*", code[start:end])
+    return computed or (len(path) < len(selection) and selection[:len(path)] == path)
+
+
+def javascript_selected_reference_call_escape(text, code, context, reference, selection):
+    calls, _, pairs, _ = context
+    argument = javascript_selected_argument_receiver(code, reference.end(), selection)
+    return (argument and any(start < reference.start() < end and not javascript_captured_read_only_call(text, code, start) for start, end in calls)) or javascript_selected_receiver_call(text, code, pairs, reference.end(), selection is None)
+
+
+def javascript_selected_receiver_call(text, code, pairs, start, carrier):
+    # Member calls execute with the original object as receiver. A bare producer
+    # call is checked through its returned origins, not a synthetic result member.
+    members = javascript_mutation_members(code, start)
+    if members is None:
+        return True
+    end, _ = members
+    return javascript_selected_grouped_receiver_call(text, code, end, carrier or end > start)
+
+def javascript_selected_unproved_carriers(text, code, root, proved):
+    carriers = javascript_destructured_aliases(text, code, root)
+    if carriers is None:
+        return None
+    for assignment in javascript_alias_assignments(code):
+        alias = assignment.group("alias")
+        expression = fallback_expression(text[assignment.end():], typescript=True)
+        if alias not in proved and javascript_expression_uses_root(expression, root):
+            # A proved scalar result cannot carry the mutable input to a callee.
+            # Keep its initializer and the original input in their origin scans.
+            if not (javascript_selected_scalar_metadata(expression) or javascript_captured_primitive_result(expression, text) or javascript_selected_assignment_value_paths(expression, root, []) == []):
+                carriers.add(alias)
+    return carriers - set(proved)
+
+
+
+
+
+def javascript_selected_carrier_risk(text, code, root, carriers):
+    return any(javascript_unproved_alias_mutation(text, code, alias, root) for alias in carriers)
+
+
+def javascript_selected_grouped_receiver_call(text, code, end, receiver):
+    while closing := re.match(r"\s*\)", code[end:]):
+        end += closing.end()
+        members = javascript_mutation_members(code, end)
+        if members is None:
+            return True
+        cursor, _ = members
+        receiver = receiver or cursor > end
+        end = cursor
+    return receiver and re.match(r"\s*(?:\?\.\s*)?(?:\(|`)", text[end:]) is not None
+
+
+def javascript_selected_interpolated_templates(text):
+    # Template masking removes executable interpolation references. Retain raw
+    # template origins and decline selected proof when an object may cross them.
+    templates, cursor = [], 0
+    while cursor < len(text):
+        end = javascript_noncode_end(text, cursor)
+        if end is None:
+            cursor += 1
+            continue
+        if text[cursor] == "`" and "${" in text[cursor:end]:
+            templates.append(text[cursor:end])
+        cursor = end
+    return tuple(templates)
+
+
+def javascript_selected_argument_context(text, code):
+    pairs, scopes, declarations = javascript_declaration_context(code)
+    if declarations is None:
+        return None
+    calls = tuple((start, end) for start, end in pairs.items()
+                  if code[start] == "(" and javascript_selected_argument_callee(code[:start]))
+    return calls, frozenset(declarations), pairs, javascript_selected_interpolated_templates(text)
+
+def javascript_selected_argument_callee(prefix):
+    prefix = prefix.rstrip()
+    name = re.search(r"[A-Za-z_$][\w$]*$", prefix)
+    if name is not None and name.group() in {"if", "while", "for", "switch", "catch", "with", "typeof", "void", "delete", "function"}:
+        return False
+    return re.search(r"(?:[\w$)\]>]|\?\.)$", prefix) is not None
+
+
+def javascript_selected_alias_paths(text, code, parts) -> dict[str, list[str]] | None:
+    aliases = {parts[0]: parts[1:]}
+    pending = [parts[0]]
+    while pending:
+        root = pending.pop()
+        additions = javascript_selected_alias_additions(text, code, root, aliases[root])
+        if additions is None:
+            return None
+        for alias, selection in additions.items():
+            if not javascript_add_selected_alias(aliases, pending, alias, selection):
+                return None
+    return aliases
+
+
+def javascript_unproved_alias_mutation(text, code, alias, root):
+    # Unproved aliases may be carriers, destructured members or shallow copies.
+    # Refuse their writes and callee escapes without evaluating local functions.
+    writes = javascript_member_write_expressions(text, code, alias)
+    return writes is None or bool(writes) or javascript_alias_mutation_risk(code, alias, root) or javascript_selected_argument_escape(text, {alias: None})
+
+
+def javascript_add_selected_alias(aliases, pending, alias, selection) -> bool:
+    if alias in aliases:
+        return aliases[alias] == selection
+    if len(aliases) >= MAX_JAVASCRIPT_INITIALIZER_ROOTS:
+        return False
+    aliases[alias] = selection
+    pending.append(alias)
+    return True
+
+
+
+
+def javascript_unproved_selected_alias(text, code, root, proved) -> bool:
+    pending, seen = [root], {root}
+    while pending:
+        source = pending.pop()
+        carriers = javascript_selected_unproved_carriers(text, code, source, proved)
+        if carriers is None or javascript_selected_carrier_risk(text, code, root, carriers):
+            return True
+        for alias in sorted(carriers - seen):
+            if len(seen) >= MAX_JAVASCRIPT_INITIALIZER_ROOTS:
+                return True
+            seen.add(alias)
+            pending.append(alias)
+    return False
+
+
+def javascript_selected_alias_additions(text, code, root, selection) -> dict[str, list[str]] | None:
+    additions = {}
+    for assignment in javascript_alias_assignments(code):
+        path = javascript_selected_assignment_path(text, assignment, root, selection)
+        if path is None:
+            continue
+        alias = assignment.group("alias")
+        if alias in additions and additions[alias] != path:
+            return None
+        additions[alias] = path
+    destructured = javascript_destructured_aliases(text, code, root)
+    return None if javascript_selected_alias_addition_risk(text, code, root, additions, destructured) else additions
+
+def javascript_selected_assignment_value_paths(expression, root, selection, depth=0):
+    # Only value branches can carry an object identity. Conditions and unrelated
+    # branches retain their literal scans, without becoming receiver aliases.
+    if depth >= MAX_JAVASCRIPT_INITIALIZER_ROOTS:
+        return None
+    value = javascript_grouped_reference_code(expression).strip()
+    code = javascript_binding_code(value)
+    if code.startswith('(') and javascript_balanced_binding_end(code, 0, '(', ')') == len(code):
+        return javascript_selected_assignment_value_paths(value[1:-1], root, selection, depth + 1)
+    conditional = javascript_conditional_value_origins(value, [])
+    branches = conditional[1:] if conditional is not None else javascript_selected_nullable_origins(value, [], depth)
+    if branches is not None:
+        paths = [javascript_selected_assignment_value_paths(branch, root, selection, depth + 1) for branch in branches]
+        return None if None in paths else [path for branch_paths in paths for path in branch_paths]
+    if re.fullmatch(URI_CREDENTIAL_REFERENCE_TEXT, value) is None:
+        return None if javascript_expression_uses_root(value, root) else []
+    parts = value.replace('?.', '.').split('.')
+    return [selection[len(parts[1:]):]] if parts[0] == root and selection[:len(parts[1:])] == parts[1:] else []
+
+
+def javascript_selected_assignment_path(text, assignment, root, selection):
+    expression = fallback_expression(text[assignment.end():], typescript=True)
+    paths = javascript_selected_assignment_value_paths(expression, root, selection)
+    return paths[0] if paths and all(path == paths[0] for path in paths) else None
+
+
+def javascript_selected_alias_addition_risk(text, code, root, additions, destructured) -> bool:
+    if destructured is None or javascript_unproved_selected_alias(text, code, root, additions):
+        return True
+    return any(javascript_alias_mutation_risk(code, alias, root) for alias in destructured)
+
+
+
+def javascript_selected_alias_writes(text, code, alias, selection) -> list[str] | None:
+    pairs = javascript_scope_pairs(code)
+    values = []
+    for match in re.finditer(r"(?<![\w$.])" + re.escape(alias) + r"(?![\w$])", code):
+        origins = javascript_selected_alias_write(text, code, match.end(), selection, pairs)
+        if origins is None:
+            return None
+        values.extend(origins)
+    return values
+
+def javascript_unresolved_grouped_write(code, pairs, start):
+    # A grouped expression that the normalizer cannot prove may return an
+    # alias. Refuse its writes, including calls and computed destinations.
+    if pairs is None:
+        return True
+    scope = javascript_selector_enclosing_scope(pairs, start)
+    if scope < 0 or code[scope] != "(":
+        return False
+    suffix = code[pairs[scope]:]
+    return re.match(r"(?:\s*\)|\s*(?:\?\.|\.)\s*[A-Za-z_$][\w$]*|\s*\[[^\r\n]*?\])*\s*(?:\?\?|\|\||&&|<<|>>>?|[+\-*/%&|^])?=(?!=|>)", suffix) is not None
+
+def javascript_selected_alias_write(text, code, start, selection, pairs) -> list[str] | None:
+    members = javascript_mutation_members(code, start)
+    if members is None:
+        return None
+    end, computed = members
+    if javascript_unresolved_grouped_write(code, pairs, end):
+        return None
+    assignment = re.match(r"\s*(?:\?\?|\|\||&&|<<|>>>?|[+\-*/%&|^])?=(?!=|>)", code[end:])
+    if end == start or assignment is None:
+        return []
+    if computed:
+        return None
+    path = re.findall(r"[A-Za-z_$][\w$]*", code[start:end])
+    expression = fallback_expression(text[end + assignment.end():], typescript=True)
+    return javascript_selected_write_origins(expression, path, selection)
+
+
+
+def javascript_selected_scalar_metadata(expression):
+    # Only proved scalar metadata can ignore a sibling write. Function, object
+    # and unresolved values can execute during later receiver use or coercion.
+    expression = expression.strip()
+    if javascript_syntax_boolean_expression(expression) or expression == "null":
+        return True
+    if expression[:1] in {"'", '"'}:
+        return csharp_quoted_literal_end(expression, 0, verbatim=False, interpolated=False) == len(expression)
+    return re.fullmatch(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?", expression) is not None
+
+def javascript_selected_write_origins(expression, path, selection) -> list[str] | None:
+    if "__proto__" in path or "prototype" in path:
+        return None
+    if selection[:len(path)] == path:
+        return javascript_selected_value_origins(expression, selection[len(path):])
+    if path[:len(selection)] == selection:
+        return [expression]
+    return [] if javascript_selected_scalar_metadata(expression) else None
+
+def javascript_inline_type_text(expression: str) -> str:
+    # A pure object assertion has type names only. Preserve the asserted value
+    # and every runtime suffix; quoted or computed members receive no mask.
+    pattern = re.compile(r"\bas\s*\{(?:\s*[A-Za-z_$][\w$]*\??\s*:\s*[A-Za-z_$][\w$]*(?:\s*\|\s*[A-Za-z_$][\w$]*)*\s*;?)+\s*\}(?:\s*\|\s*(?:undefined|null))?")
+    code = javascript_binding_code(expression)
+    return mask_ranges(expression, [match.span() for match in pattern.finditer(expression)
+                                   if match.group() == code[match.start():match.end()]])
+
+
+def javascript_metadata_comparison_text(expression) -> str:
+    # Closed word selectors on role/mode members are control metadata. A
+    # credential member, opaque bytes or a constructed suffix is not a selector.
+    pattern = re.compile(r"(?P<ref>[A-Za-z_$][\w$]*(?:(?:\?\.|\.)[A-Za-z_$][\w$]*)*)\s*(?:===|!==)\s*(?P<q>[\"'])(?P<value>[a-z]{3,8})(?P=q)")
+    code = javascript_binding_code(expression)
+    spans = [match.span() for match in pattern.finditer(expression)
+             if code[match.start("ref"):match.end("ref")] == match.group("ref")
+             and re.search(r"(?:\.mode|\.role|Role)$", match.group("ref"))]
+    return javascript_selector_literal_mask(expression, spans)
+
+
+
+def javascript_named_selector_metadata_uses(text, owner) -> bool:
+    if not owner or not owner.endswith("Source") or "." in owner:
+        return False
+    code = javascript_binding_code(text)
+    pairs = javascript_scope_pairs(code)
+    if pairs is None:
+        return False
+    names = javascript_selector_field_names(code, owner)
+    return names is not None and javascript_selector_uses_metadata(text, code, pairs, names)
+
+
+def javascript_selector_field_names(code, owner):
+    # Follow property copies before classifying a literal as metadata. A renamed
+    # field must keep its later reads visible, just like the original field.
+    names = {owner, re.sub(r"^__guard_scope_[0-9]+_", "", owner)}
+    while len(names) <= MAX_JAVASCRIPT_INITIALIZER_ROOTS:
+        additions = javascript_selector_field_copies(code, names) - names
+        if not additions:
+            return names
+        names.update(additions)
+    return None
+
+
+def javascript_selector_field_copies(code, names):
+    values = "|".join(re.escape(name) for name in sorted(names))
+    receiver = r"(?:[A-Za-z_$][\w$]*(?:(?:\?\.|\.)[A-Za-z_$][\w$]*)*(?:\?\.|\.))?"
+    pattern = re.compile(r"[{},]\s*(?P<field>[A-Za-z_$][\w$]*)\s*:\s*" + receiver + r"(?:" + values + r")\s*(?=[,}])")
+    return {match.group("field") for match in pattern.finditer(code)
+            if match.group("field").endswith("Source")}
+
+
+def javascript_selector_uses_metadata(text, code, pairs, names):
+    return all(javascript_selector_metadata_use(text, code, pairs, use, name, names)
+               for name in sorted(names) for use in javascript_selector_use_pattern(name).finditer(code))
+
+def javascript_selector_use_pattern(owner):
+    public = re.sub(r"^__guard_scope_[0-9]+_", "", owner)
+    names = "|".join(re.escape(name) for name in dict.fromkeys((owner, public)))
+    return re.compile(r"(?<![\w$])(?:" + names + r")(?![\w$])")
+
+def javascript_selector_metadata_use(text, code, pairs, use, owner, names) -> bool:
+    # Type keys declare a source shape, never a runtime selector use. Keep the
+    # outer literal scan; this only supplies the existing metadata-use proof.
+    scope = javascript_selector_enclosing_scope(pairs, use.start())
+    if any(start <= use.start() < end for start, end in typescript_object_type_ranges(text, code)):
+        return True
+    if scope >= 0 and code[scope] == "{" and code[:scope].rstrip().endswith(":"):
+        parent = javascript_selector_enclosing_scope(pairs, scope)
+        if javascript_selector_parameter_scope(code, pairs, parent):
+            return True
+    prefix, suffix = code[:use.start()].rstrip(), code[use.end():].lstrip()
+    if re.search(r"\bconst\s*$", prefix) and suffix.startswith("="):
+        return True
+    if javascript_selector_control_use(text, code, use):
+        return True
+    return javascript_selector_structural_use(code, pairs, use, owner, names)
+
+
+
+def javascript_selector_control_use(text, code, use) -> bool:
+    prefix, suffix = code[:use.start()].rstrip(), code[use.end():].lstrip()
+    receiver = r"(?:[A-Za-z_$][\w$]*(?:(?:\?\.|\.)[A-Za-z_$][\w$]*)*(?:\?\.|\.))?"
+    if re.search(r"!\s*" + receiver + r"$", prefix) and re.match(r"(?:&&|\|\||[),;])", suffix):
+        return True
+    comparison = re.match(r"\s*(?:===|!==)\s*(?P<q>[\"'])(?P<value>[a-z]{1,7})(?P=q)\s*(?=&&|\|\||[)?,;])", text[use.end():])
+    return comparison is not None and comparison.group("value") not in PROMPT_SECRET_THEME_WORDS
+
+
+def javascript_selector_structural_use(code, pairs, use, owner, names) -> bool:
+    prefix, suffix = code[:use.start()].rstrip(), code[use.end():].lstrip()
+    scope = javascript_selector_enclosing_scope(pairs, use.start())
+    if suffix.startswith(":"):
+        return javascript_selector_key_definition(code, pairs, scope, prefix)
+    return scope >= 0 and code[scope] == "{" and javascript_selector_property_value(prefix, suffix, names)
+
+def javascript_selector_key_definition(code, pairs, scope, prefix) -> bool:
+    # A ternary branch also ends in a colon. Only a brace-delimited key
+    # position proves output metadata; branch values retain their origins.
+    if scope < 0 or code[scope] != "{" or not prefix.endswith(("{", ",")) or re.match(r"\s*=(?!=)", code[pairs[scope]:]) is not None:
+        return False
+    # A destructured key reads the field into another binding. It is not
+    # evidence that the originating literal remains output metadata.
+    parent = javascript_selector_enclosing_scope(pairs, scope)
+    return not javascript_selector_parameter_scope(code, pairs, parent)
+
+def javascript_selector_parameter_scope(code, pairs, scope) -> bool:
+    if scope < 0 or code[scope] != "(":
+        return False
+    prefix, suffix = code[:scope].rstrip(), code[pairs[scope]:].lstrip()
+    return re.search(r"\bfunction(?:\s+[A-Za-z_$][\w$]*)?\s*$", prefix) is not None or javascript_selector_parameter_tail(suffix)
+
+def javascript_selector_parameter_tail(suffix) -> bool:
+    return suffix.startswith(("=>", "{")) or re.match(r":\s*[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*(?:\s*\|\s*[A-Za-z_$][\w$]*)*\s*(?:=>|\{)", suffix) is not None
+
+def javascript_selector_enclosing_scope(pairs, position):
+    return max((start for start, end in pairs.items() if start < position < end), default=-1)
+
+
+def javascript_selector_property_value(prefix, suffix, names) -> bool:
+    if not suffix.startswith((",", "}")):
+        return False
+    fields = "|".join(re.escape(name) for name in sorted(names))
+    receiver = r"(?:[A-Za-z_$][\w$]*(?:(?:\?\.|\.)[A-Za-z_$][\w$]*)*(?:\?\.|\.))?"
+    return prefix.endswith(("{", ",")) or re.search(r"\b(?:" + fields + r")\s*:\s*" + receiver + r"$", prefix) is not None
+
+def javascript_named_conditional_selector_text(text, expression, owner) -> str:
+    if not javascript_named_selector_metadata_uses(text, owner):
+        return expression
+    pattern = re.compile(r"(?P<ref>[A-Za-z_$][\w$]*)\s*\?\s*(?P<q>[\"'])(?P<value>[a-z]{1,7})(?P=q)\s*:")
+    code = javascript_binding_code(expression)
+    spans = [match.span() for match in pattern.finditer(expression)
+             if code[match.start("ref"):match.end("ref")] == match.group("ref")
+             and re.fullmatch(re.escape(match.group("value")) + r"[A-Z][A-Za-z]*", re.sub(r"^__guard_scope_[0-9]+_", "", match.group("ref")))
+             and match.group("value") not in PROMPT_SECRET_THEME_WORDS]
+    return javascript_selector_literal_mask(expression, spans)
+
+
+
+def javascript_boolean_predicate(expression) -> bool:
+    # A comparison followed by conjunctions and a final negation returns only
+    # falsey absence or Boolean values. Its checked selectors never become bytes.
+    ref = URI_CREDENTIAL_REFERENCE_TEXT
+    comparison = r"(?:" + ref + r"\s*===\s*(?:" + ref + r"|\s+))"
+    return re.fullmatch(r"\s*" + comparison + r"(?:\s*&&\s*(?:" + ref + r"|" + comparison + r"))*\s*&&\s*!" + ref + r"\s*", expression) is not None
+
+
+def javascript_typeof_selector_text(expression: str) -> str:
+    # typeof's closed language result words select a branch; they are not its
+    # returned bytes. Keep every operand and branch in the origin graph.
+    operand = r"(?:" + URI_CREDENTIAL_REFERENCE_TEXT + r"|\(\s*" + URI_CREDENTIAL_REFERENCE_TEXT + r"\s*\)(?:\?\.|\.)[A-Za-z_$][\w$]*)"
+    pattern = re.compile(r"\btypeof\s+" + operand
+                         + r"\s*(?:===|!==|==|!=)\s*(?P<q>[\"'])(?:undefined|object|boolean|number|bigint|string|symbol|function)(?P=q)")
+    code = javascript_binding_code(expression)
+    spans = [match.span() for match in pattern.finditer(expression)
+             if code[match.start():match.start() + 6] == "typeof"]
+    return javascript_selector_literal_mask(expression, spans)
+
+
+def javascript_selector_literal_mask(expression, spans) -> str:
+    # Only the literal part of a proved selector is erased. References and
+    # operators remain visible to alias, later-write and constructor checks.
+    result = list(expression)
+    for start, end in spans:
+        for match in re.finditer(r"[\"'][^\"'\r\n]*[\"']", expression[start:end]):
+            result[start + match.start():start + match.end()] = "null" + " " * (len(match.group()) - 4)
+    return "".join(result)
+
+
+def javascript_reason_selector_text(text, expression) -> str:
+    pattern = re.compile(r"(?P<ref>[A-Za-z_$][\w$]*(?:(?:\?\.|\.)[A-Za-z_$][\w$]*)*\.reason)"
+                         + r"\s*===\s*(?P<q>[\"'])(?P<value>[a-z]{1,16}(?:_[a-z]{1,16}){1,3})(?P=q)")
+    code = javascript_binding_code(text)
+    spans = [match.span() for match in pattern.finditer(expression)
+             if javascript_matching_reason_case(text, code, match.group("ref"), match.group("value"))]
+    return javascript_selector_literal_mask(expression, spans)
+
+
+def javascript_matching_reason_case(text, code, reference, value) -> bool:
+    # A matching case in an actual switch on the same reason reference binds
+    # this comparison to a named status selector. Opaque values do not match.
+    pattern = re.compile(r"\bswitch\s*\(\s*" + re.escape(reference) + r"\s*\)\s*\{")
+    for match in pattern.finditer(code):
+        end = javascript_balanced_binding_end(code, match.end() - 1, "{", "}")
+        if end is not None and end - match.start() <= 8192:
+            case = re.compile(r"\bcase\s*([\"'])" + re.escape(value) + r"\1\s*:")
+            if any(code[item.start():item.start() + 4] == "case" for item in case.finditer(text, match.end(), end)):
+                return True
+    return False
+
+
+def javascript_named_discriminator_text(expression, owner) -> str:
+    if not owner:
+        return expression
+    pattern = re.compile(r"(?P<key>\bkind)\s*:\s*(?P<q>[\"'])(?P<value>[a-z]{1,16}(?:-[a-z]{1,16}){1,3})(?P=q)\s+as\s+const\b")
+    code = javascript_binding_code(expression)
+    spans = [match.span() for match in pattern.finditer(expression)
+             if code[match.start("key"):match.end("key")] == "kind"
+             and javascript_discriminator_matches_owner(owner, match.group("value"))]
+    return javascript_selector_literal_mask(expression, spans)
+
+
+def javascript_discriminator_matches_owner(owner, value) -> bool:
+    # A const kind tag must spell the named binding's prefix. This admits a
+    # named metadata selector, not a free literal or a resolver argument.
+    normalized = re.sub(r"[^a-z]", "", owner.casefold())
+    prefix = value.replace("-", "")
+    return normalized.startswith(prefix) and normalized[len(prefix):] in {"issuer", "kind", "type"}
+
+
+def javascript_origin_selector_text(text, expression, owner=None) -> str:
+    selected = javascript_fixture_origin_text(javascript_inline_type_text(expression))
+    selected = javascript_typeof_selector_text(selected)
+    selected = javascript_metadata_comparison_text(selected)
+    selected = javascript_named_conditional_selector_text(text, selected, owner)
+    selected = javascript_reason_selector_text(text, selected)
+    selected = javascript_declared_kind_comparison_text(text, selected)
+    return javascript_named_discriminator_text(selected, owner)
+
+
+def javascript_source_assignment_ranges(text, dialect, ranges) -> tuple[tuple[int, int], ...]:
+    if dialect is None:
+        return ()
+    colons = javascript_conditional_colon_ranges(text)
+    prefixes = SECRET_ASSIGNMENT_PREFIX_PATTERN.finditer(mask_ranges(text, ranges + colons))
+    return colons + javascript_reference_assignment_ranges(text, prefixes)
+
+
+def javascript_reference_assignment_ranges(text, prefixes) -> tuple[tuple[int, int], ...]:
+    code = javascript_binding_code(text)
+    return tuple(prefix.span() for prefix in prefixes
+                 if javascript_safe_reference_assignment(text, code, prefix))
+
+
+def javascript_reference_assignment_expression(text, code, prefix):
+    # The conditional reference proof owns value branches. Type annotations
+    # and ordinary expressions retain their existing literal/value checks.
+    if code[prefix.start():prefix.end()] != prefix.group():
+        return None
+    expression = fallback_expression(text[prefix.end():], typescript=True)
+    if len(expression) > 8192 or re.search(r"\?|&&|\|\|", expression) is None:
+        return None
+    owner = re.match(r"[A-Za-z_$][\w$]*", prefix.group().strip())
+    return javascript_origin_selector_text(text, expression, owner.group() if owner else None)
+
+
+def javascript_safe_reference_assignment(text, code, prefix) -> bool:
+    selected = javascript_reference_assignment_expression(text, code, prefix)
+    return selected is not None and javascript_proven_reference_expression(text, prefix.end(), selected)
+
+
+def javascript_syntax_boolean_expression(expression):
+    # Prove result syntax only. Mutable method calls retain their value origins.
+    parts = list(re.finditer(r"(?:^|\|\||&&)(?P<part>.*?)(?=\|\||&&|$)", expression, re.DOTALL))
+    return bool(parts) and len(parts) <= MAX_JAVASCRIPT_INITIALIZER_ROOTS and (
+        sum(part.end() - part.start() for part in parts) == len(expression)
+    ) and all(javascript_syntax_boolean_part(part.group("part")) for part in parts)
+
+
+def javascript_syntax_boolean_part(part):
+    reference = URI_CREDENTIAL_REFERENCE_TEXT
+    comparison = reference + r"\s*(?:===|!==|==|!=|<=|>=|<|>)\s*" + reference
+    return re.fullmatch(r"\s*(?:" + comparison + r"|!{1,2}\s*" + reference + r"|true|false)\s*", part) is not None
+
+
+def javascript_prototype_writes(text, code, selected=()):
+    code, natives, roots, unsafe, _ = javascript_prototype_context(text)
+    return unsafe or javascript_prototype_mutations(text, code, roots, natives, selected)
+
+
+@functools.lru_cache(maxsize=8)
+def javascript_prototype_context(text):
+    # Reuse immutable source facts across selected fields. Target-specific
+    # mutation checks stay outside this eight-entry source cache.
+    code = javascript_prototype_discovery_code(text)
+    natives = javascript_prototype_native_aliases(code)
+    roots = javascript_prototype_origin_roots(text, code, natives) if natives is not None else None
+    unsafe = javascript_prototype_context_risk(code, natives, roots)
+    arguments = javascript_selected_argument_context(text, code)
+    return code, frozenset(natives or ()), frozenset(roots or ()), unsafe, arguments
+
+
+def javascript_prototype_context_risk(code, natives, roots):
+    return roots is None or javascript_prototype_unproved_receiver(code) or javascript_prototype_escapes(code, roots, natives) or javascript_prototype_unresolved_native(code, natives)
+
+@functools.lru_cache(maxsize=8)
+def javascript_prototype_discovery_code(text):
+    # Normalize constant member selectors only for mutation discovery, retaining
+    # offsets and unresolved keys. Origin selector proof would recurse here.
+    code = javascript_initializer_value_code(text)
+    pattern = re.compile(r"(?P<optional>\?\.)?\[\s*([\"'])(?P<key>[A-Za-z_$][\w$]*)\2\s*\]")
+    projected = list(code)
+    for match in pattern.finditer(text):
+        opening = match.start() + (2 if match.group("optional") else 0)
+        if code[opening:opening + 1] == "[" and re.search(r"[\w$)\]}\"'`/>]\s*$", text[:match.start()]):
+            member = "." + match.group("key")
+            projected[match.start():match.end()] = member + " " * (len(match.group()) - len(member))
+    return javascript_grouped_member_code(javascript_prototype_member_code("".join(projected)))
+
+
+def javascript_prototype_member_code(code):
+    pattern = re.compile(r"(?<![\w$?.])[A-Za-z_$][\w$]*(?:\s*(?:\?\.|\.)\s*[A-Za-z_$][\w$]*)+")
+    projected = list(code)
+    for match in pattern.finditer(code):
+        member = re.sub(r"\s|\?", "", match.group())
+        projected[match.start():match.end()] = member + " " * (len(match.group()) - len(member))
+    return "".join(projected)
+
+def javascript_prototype_native_aliases(code):
+    # Native method copies can escape through calls without member assignments.
+    # Keep all bounded alias edges; mutation-only alias pruning would lose them.
+    edges = javascript_binding_alias_edges(code, code)
+    aliases = {"Object", "Reflect", "RegExp", "globalThis"}
+    pending = list(aliases)
+    while pending:
+        root = pending.pop()
+        destructured = javascript_destructured_aliases(code, code, root)
+        if destructured is None:
+            return None
+        additions = (edges.get(root, set()) | destructured) - aliases
+        if len(aliases | additions) > MAX_JAVASCRIPT_INITIALIZER_ROOTS:
+            return None
+        aliases.update(additions)
+        pending.extend(additions)
+    return aliases
+
+def javascript_prototype_selector_ranges(code):
+    return re.finditer(r"\.(?:__proto__|constructor|prototype|getPrototypeOf)(?![\w$])", code)
+
+
+def javascript_prototype_selector(reference):
+    return any(javascript_prototype_selector_ranges(reference))
+
+
+def javascript_prototype_unproved_receiver(code):
+    # Only identifier-rooted chains have a proved receiver. Literal/call
+    # receivers cannot borrow a selected-field provenance exemption.
+    selectors = {member.start() for member in javascript_prototype_selector_ranges(code)}
+    references = re.finditer(r"(?<![\w$.])" + URI_CREDENTIAL_REFERENCE_TEXT, code)
+    proved = {reference.start() + member.start() for reference in references
+              for member in javascript_prototype_selector_ranges(reference.group())}
+    return not selectors <= proved
+
+
+def javascript_prototype_initial_roots(code):
+    return frozenset({"Object", "Reflect", "RegExp", "globalThis"} | {
+        reference.split(".")[0] for reference in javascript_initializer_references(code)
+        if javascript_prototype_selector(reference)
+    })
+
+
+def javascript_prototype_origin_roots(text, code, natives):
+    roots = set(javascript_prototype_initial_roots(code))
+    for _ in range(MAX_JAVASCRIPT_INITIALIZER_ROOTS):
+        additions = javascript_prototype_origin_additions(text, code, roots, natives)
+        if additions is None or len(roots | additions) > MAX_JAVASCRIPT_INITIALIZER_ROOTS:
+            return None
+        if additions <= roots:
+            return roots
+        roots.update(additions)
+    return None
+
+
+def javascript_prototype_origin_additions(text, code, roots, natives):
+    additions = {match.group("alias") for match in javascript_alias_assignments(code)
+                 if javascript_prototype_value_origin(fallback_expression(code[match.end():], typescript=True), roots, natives)}
+    returned = javascript_prototype_return_aliases(text, code, roots, natives)
+    return None if returned is None else additions | returned
+
+
+def javascript_prototype_return_aliases(text, code, roots, natives):
+    additions = set()
+    for name in set(re.findall(r"\bfunction\s*\*?\s+([A-Za-z_$][\w$]*)", code)):
+        returned = javascript_local_function_origins(text, code, name)
+        if returned is None:
+            return None
+        if any(javascript_prototype_value_origin(value, roots, natives) for value in returned):
+            additions.add(name)
+    return additions
+
+def javascript_prototype_reference_origin(reference, roots, natives):
+    return reference in natives or reference.split(".")[0] in roots - {"Object", "Reflect", "RegExp"}
+
+
+def javascript_prototype_value_origin(value, roots, natives):
+    code = javascript_prototype_discovery_code(value)
+    references = javascript_initializer_references(code)
+    if any(javascript_prototype_selector(reference) for reference in references):
+        return True
+    # Bare native values carry prototype ownership through aliases and returns.
+    # Direct native calls keep the namespace checks in prototype_escapes.
+    if any(javascript_prototype_reference_origin(reference, roots, natives) for reference in references):
+        return True
+    return any(re.search(r"(?<![\w$.])" + re.escape(root) + r"\s*(?:\[|\()", code) for root in natives)
+
+
+def javascript_prototype_mutations(text, code, roots, natives, selected):
+    if any(javascript_mutation_alias_writes(text, code, root) != [] for root in roots):
+        return True
+    targets = roots | set(selected)
+    for native in natives:
+        if any(javascript_prototype_operation(code, native, target) for target in targets):
+            return True
+    return False
+
+
+def javascript_prototype_operation(code, native, target):
+    for operation in re.finditer(r"(?<![\w$.])" + re.escape(native) + r"(?![\w$])", code):
+        members = javascript_mutation_members(code, operation.end())
+        if members is None:
+            return True
+        if re.match(r"\s*\(\s*" + re.escape(target) + r"(?![\w$])", code[members[0]:]):
+            return True
+    return False
+
+
+def javascript_prototype_escapes(code, roots, natives):
+    pairs = javascript_scope_pairs(code)
+    if pairs is None:
+        return True
+    if javascript_prototype_query_escape(code, pairs):
+        return True
+    # Native namespaces and their aliases cannot escape through unproved calls.
+    # Direct native member calls retain their existing mutation/query checks.
+    return any(
+        javascript_prototype_alias_escape(code, pairs, root, native_namespace=root in natives)
+        for root in roots - {"Object", "Reflect", "RegExp"}
+    ) or any(
+        javascript_prototype_alias_escape(code, pairs, root, native_namespace=True) for root in natives
+    )
+
+
+def javascript_prototype_query_escape(code, pairs):
+    for query in re.finditer(r"\b[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\.getPrototypeOf(?![\w$])", code):
+        call = re.match(r"\s*\(", code[query.end():])
+        if call is None:
+            return True
+        end = pairs.get(query.end() + call.end() - 1)
+        if javascript_prototype_query_result_escape(code, pairs, query.start(), end):
+            return True
+    return False
+
+
+def javascript_prototype_query_result_escape(code, pairs, start, end):
+    if end is None or javascript_prototype_value_escape(code, pairs, start, end):
+        return True
+    return code[end:].lstrip().startswith((".", "[", "?.")) or javascript_unresolved_grouped_write(code, pairs, end)
+
+
+def javascript_prototype_unresolved_native(code, natives):
+    for native in natives:
+        for reference in re.finditer(r"(?<![\w$.])" + re.escape(native) + r"(?![\w$])", code):
+            members = javascript_mutation_members(code, reference.end())
+            if members is None or members[1]:
+                return True
+            if re.match(r"\s*\?\.\s*[\[(]", code[reference.end():]):
+                return True
+    return False
+
+def javascript_prototype_alias_escape(code, pairs, root, *, native_namespace=False):
+    for reference in re.finditer(r"(?<![\w$.])" + re.escape(root) + r"(?![\w$])", code):
+        members = javascript_mutation_members(code, reference.end())
+        if members is None or javascript_prototype_value_escape(code, pairs, reference.start(), members[0]):
+            return True
+        if not native_namespace and javascript_prototype_unproved_invocation(code, reference.start(), members[0]):
+            return True
+    return False
+
+
+def javascript_prototype_unproved_invocation(code, start, end):
+    # A declaration is not a call. Extracted, grouped and receiver-changing
+    # invocations can escape a returned prototype; decline this value proof.
+    if re.search(r"\bfunction\s*\*?\s*$", code[:start]):
+        return False
+    return re.match(r"\s*\)*\s*\(", code[end:]) is not None
+
+def javascript_prototype_value_escape(code, pairs, start, end):
+    # Admit only proved syntax roles. Calls, containers and operand wrappers
+    # cannot carry a bare prototype/native value through an unproved callee.
+    prefix, suffix = code[:start].rstrip(), code[end:].lstrip()
+    if javascript_prototype_scalar_role(prefix, suffix):
+        return False
+    if re.match(r"(?:\?\.)?\s*\(", suffix) or re.search(r"\bfunction\s*\*?\s*$", prefix):
+        return False
+    return not javascript_prototype_binding_role(code, start, end)
+
+
+def javascript_prototype_scalar_role(prefix, suffix):
+    comparison = r"(?:[!=]==?|[<>]=?)"
+    return re.search(comparison + r"$", prefix) is not None or re.match(comparison, suffix) is not None
+
+
+def javascript_prototype_declared_bindings(code):
+    return (assignment for assignment in javascript_alias_assignments(code)
+            if re.search(r"\b(?:const|let|var)\s*$", code[:assignment.start("alias")]))
+
+
+def javascript_prototype_binding_role(code, start, end):
+    for assignment in javascript_prototype_declared_bindings(code):
+        if start == assignment.start("alias"):
+            return True
+        if assignment.end() <= start and not code[assignment.end():start].strip():
+            value = fallback_expression(code[assignment.end():], typescript=True)
+            if value.strip() == code[start:end].strip():
+                return True
+    return False
+
+
+def javascript_proven_reference_expression(text, start, expression) -> bool:
+    owned = javascript_scoped_code_expression(text, start, expression)
+    if owned is not None:
+        return owned
+    if javascript_expression_has_literal(expression):
+        return False
+    if any((javascript_boolean_predicate(expression), javascript_syntax_boolean_expression(expression))):
+        return True
+    code = javascript_grouped_reference_code(expression)
+    roots = list(re.finditer(r"(?<![\w$.])(?P<root>[A-Za-z_$][\w$]*(?:(?:\?\.|\.)[A-Za-z_$][\w$]*)*)", code))
+    return len(roots) <= MAX_JAVASCRIPT_INITIALIZER_ROOTS and all(
+        javascript_initializer_object_key(code, root)
+        or javascript_scoped_value_reference(text, start + root.start(), root.group()) for root in roots
+    )
+
+
+
+
+
+def javascript_code_imported_name(text, code, root):
+    pattern = r'\bimport\s+(?:([A-Za-z_$][\w$]*)\s*,?\s*)?(?:\*\s+as\s+([A-Za-z_$][\w$]*)|\{([^}]+)\})?\s+from\s*(["\x27])[^"\x27]+\4'
+    for match in re.finditer(pattern, text):
+        if code[match.start():match.start() + 6] != 'import':
+            continue
+        names = [match.group(1), match.group(2)]
+        for field in (match.group(3) or '').split(','):
+            bound = re.fullmatch(r'\s*([A-Za-z_$][\w$]*)(?:\s+as\s+([A-Za-z_$][\w$]*))?\s*', field)
+            if bound:
+                names.append(bound.group(2) or bound.group(1))
+        if root in names:
+            return True
+    return False
+
+
+@functools.lru_cache(maxsize=128)
+def javascript_code_parameter(code, root):
+    pairs = javascript_scope_pairs(code)
+    if pairs is None:
+        return False
+    owners = [javascript_named_function_bindings(code, pairs),
+              javascript_arrow_parameter_bindings(code, pairs),
+              javascript_method_parameter_bindings(code, pairs)]
+    return all(owner is not None for owner in owners) and any(
+        name == root and position < body
+        for owner in owners for position, (body, name) in owner.items())
+
+
+def javascript_code_method_container(expression):
+    expression = expression.strip()
+    code = javascript_binding_code(expression)
+    if not (code.startswith('{') and javascript_balanced_binding_end(code, 0, '{', '}') == len(code)):
+        return False
+    fields = [field for field in split_top_level_call_arguments(expression[1:-1]) if field.strip()]
+    if not fields:
+        return False
+    for field in fields:
+        code = javascript_binding_code(field.strip())
+        method = re.match(r'(?:async\s+)?[A-Za-z_$][\w$]*\s*\(', code)
+        if method is None:
+            return False
+        end = javascript_balanced_binding_end(code, method.end() - 1, '(', ')')
+        body = javascript_function_body_start(code, end) if end is not None else None
+        if body is None or javascript_balanced_binding_end(code, body, '{', '}') != len(code):
+            return False
+    return True
+
+
+
+def javascript_code_callable_argument_escape(text, aliases):
+    # A bound receiver-free function call does not mutate its containing object.
+    # Passing that object or an ancestor as data keeps the strict escape rule.
+    code, _, _, _, context = javascript_prototype_context(text)
+    if context is None:
+        return True
+    calls, declarations, _, templates = context
+    for alias, selection in aliases.items():
+        if any(javascript_selector_use_pattern(alias).search(template) for template in templates):
+            return True
+        for reference in re.finditer(r'(?<![\w$])' + re.escape(alias) + r'(?![\w$])', code):
+            if javascript_selected_argument_nonvalue(code, reference, declarations) or (
+                    re.search(r'\btypeof\s*$', code[:reference.start()])
+                    and not re.match(r'\s*(?:\?\.|\.|\[)', code[reference.end():])):
+                continue
+            if javascript_selected_argument_receiver(code, reference.end(), selection) and any(
+                    start < reference.start() < end and not javascript_captured_read_only_call(text, code, start)
+                    for start, end in calls):
+                return True
+    return False
+
+
+def javascript_code_callable_selection(text, code, parts, selected):
+    if not selected or not all(javascript_code_callable_reference(text, value, receiver=True) for value in selected):
+        return False
+    aliases = {parts[0]: parts[1:]}
+    for _ in range(MAX_JAVASCRIPT_INITIALIZER_ROOTS):
+        added = False
+        for assignment in javascript_alias_assignments(code):
+            value = fallback_expression(text[assignment.end():], typescript=True).strip()
+            alias = assignment.group('alias')
+            if value in aliases and alias not in aliases:
+                aliases[alias] = aliases[value]
+                added = True
+        if not added:
+            break
+    else:
+        return False
+    if aliases is None or javascript_prototype_writes(text, code, aliases) or javascript_code_callable_argument_escape(text, aliases):
+        return False
+    for root, selection in aliases.items():
+        if javascript_object_mutation_risk(code, root):
+            return False
+        carriers = javascript_selected_unproved_carriers(text, code, root, aliases)
+        if carriers is None:
+            return False
+        # A top-level spread allocates another container. It does not alias
+        # the source container's callable field; nested carriers remain held.
+        retained = set()
+        for carrier in carriers:
+            values = javascript_binding_initializers(text, code, carrier)
+            source_reference = re.compile(r'(?<![\w$.])' + re.escape(root) + r'(?![\w$])')
+            def copied_or_code(value):
+                if re.fullmatch(r'\s*\{\s*\.\.\.\s*' + re.escape(root) + r'\s*,?\s*\}\s*', value) or javascript_code_method_container(value):
+                    return True
+                references = list(source_reference.finditer(javascript_binding_code(value)))
+                return bool(references) and all(re.match(r'\s*(?:\?\.|\.)', value[reference.end():]) for reference in references)
+            if not values or not all(copied_or_code(value) for value in values):
+                retained.add(carrier)
+        if javascript_selected_carrier_risk(text, code, root, retained):
+            return False
+    return True
+
+
+
+
+
+def javascript_code_callable_reference(text, expression, ancestors=frozenset(), receiver=False):
+    # Own data fields only receive the code-symbol route when their exact
+    # initializer resolves a function declaration or arrow. Parameters and unknown
+    # object values retain the mutable selected-value proof.
+    expression = javascript_grouped_reference_code(expression).strip()
+    if javascript_code_arrow_origins(expression) is not None:
+        return not receiver or re.search(r'(?<![\w$.])this(?![\w$])', javascript_binding_code(expression)) is None
+    if not re.fullmatch(URI_CREDENTIAL_REFERENCE_TEXT, expression):
+        return False
+    identity = (_CAPTURED_SOURCE_PATH.get(), text, expression)
+    if identity in ancestors or len(ancestors) >= MAX_JAVASCRIPT_INITIALIZER_ROOTS:
+        return False
+    ancestors = ancestors | {identity}
+    code = javascript_binding_code(text)
+    parts = expression.replace('?.', '.').split('.')
+    root, selection = parts[0], parts[1:]
+    if not selection and re.search(r'\bfunction\s+' + re.escape(root) + r'(?![\w$])', code):
+        parts = javascript_local_function_parts(text, code, re.search(r'\bfunction\s+' + re.escape(root) + r'(?![\w$])', code))
+        return not javascript_binding_initializers(text, code, root) and (not receiver or parts is not None and re.search(r'(?<![\w$.])this(?![\w$])', javascript_binding_code(parts[1])) is None)
+    if not selection and javascript_code_imported_name(text, code, root):
+        captured = javascript_captured_function(_CAPTURED_SOURCE_PATH.get(), root, dict(_CAPTURED_SOURCES.get()))
+        return captured is not None and (not receiver or re.search(r'(?<![\w$.])this(?![\w$])', javascript_binding_code(captured[2][1])) is None)
+    values = javascript_binding_initializers(text, code, root, preserve_callable=True)
+    selected = javascript_selected_expressions(values, selection)
+    return bool(selected) and all(javascript_code_callable_reference(text, value, ancestors, receiver) for value in selected)
+
+
+
+
+def javascript_code_selected_write(expression, selection):
+    # Imported/formal symbols are code references. Record actual own writes;
+    # an omitted sibling is not a supplied value. Data objects keep the stricter
+    # own-property and inherited-value owner below.
+    expression = expression.strip()
+    code = javascript_initializer_value_code(expression)
+    if selection and code.startswith('{') and javascript_balanced_binding_end(code, 0, '{', '}') == len(code):
+        values = []
+        for field in split_top_level_call_arguments(expression[1:-1]):
+            value = javascript_selected_object_field(field.strip(), selection[0])
+            if value is None:
+                return None
+            if value:
+                selected = javascript_code_selected_write(value, selection[1:])
+                if selected is None:
+                    return None
+                values.extend(selected)
+        return values
+    return javascript_selected_value_origins(expression, selection)
+
+
+def javascript_code_symbol_writes(text, code, root, selection):
+    pairs, values = javascript_scope_pairs(code), []
+    if pairs is None:
+        return None
+    for match in re.finditer(r'(?<![\w$.])' + re.escape(root) + r'(?![\w$])', code):
+        first = re.match(r'\s*(?:\?\.|\.)\s*([A-Za-z_$][\w$]*)', code[match.end():])
+        if first is not None and selection and first.group(1) != selection[0] and first.group(1) not in {'__proto__', 'prototype', 'constructor'}:
+            continue
+        members = javascript_mutation_members(code, match.end())
+        if members is None:
+            return None
+        end, computed = members
+        assignment = re.match(r'\s*(?:\?\?|\|\||&&|<<|>>>?|[+\-*/%&|^])?=(?!=|>)', code[end:])
+        if end == match.end() or assignment is None:
+            continue
+        path = re.findall(r'[A-Za-z_$][\w$]*', code[match.end():end])
+        if computed or {'__proto__', 'prototype'} & set(path) or javascript_unresolved_grouped_write(code, pairs, end):
+            return None
+        if selection[:len(path)] != path and path[:len(selection)] != selection:
+            continue
+        expression = fallback_expression(text[end + assignment.end():], typescript=True)
+        origins = javascript_code_selected_write(expression, selection[len(path):]) if selection[:len(path)] == path else [expression]
+        if origins is None:
+            return None
+        values.extend(origins)
+    return values
+
+
+def javascript_captured_code_import(text, root):
+    current, sources = _CAPTURED_SOURCE_PATH.get(), dict(_CAPTURED_SOURCES.get())
+    if current is None:
+        return None
+    code, bindings = javascript_binding_code(text), []
+    pattern = r'\bimport\s*\{([^}]+)\}\s*from\s*(["\x27])([^"\x27]+)\2'
+    for match in re.finditer(pattern, text):
+        if code[match.start():match.start() + 6] != 'import':
+            continue
+        for field in match.group(1).split(','):
+            bound = re.fullmatch(r'\s*([A-Za-z_$][\w$]*)(?:\s+as\s+([A-Za-z_$][\w$]*))?\s*', field)
+            if bound and (bound.group(2) or bound.group(1)) == root:
+                path = javascript_captured_module_path(current, match.group(3), sources)
+                if path:
+                    bindings.append((path, bound.group(1)))
+    return bindings[0] if len(bindings) == 1 else None
+
+
+def javascript_code_iteration_enclosed(pairs, start, end, position):
+    return any(begin <= position < finish for begin, finish in pairs.items()
+               if start <= begin < end)
+
+
+def javascript_code_iteration_split(code, pairs, start, end):
+    for match in re.finditer(r'(?<![\w$.])(?:of|in)(?![\w$])', code[start:end]):
+        position = start + match.start()
+        if javascript_code_iteration_enclosed(pairs, start, end, position):
+            continue
+        separators = re.finditer(';', code[start:position])
+        if any(not javascript_code_iteration_enclosed(pairs, start, end, start + value.start()) for value in separators):
+            return None
+        return position
+    return None
+
+
+def javascript_code_iteration_target(text, code, start, end, root):
+    # One masked declaration span trims the raw binding too. Punctuators can
+    # follow var/let/const without spaces; public object keys are not bindings.
+    prefix = re.match(r'^\s*(?:const|let|var)(?![\w$])\s*', code[start:end])
+    binding = text[start + (prefix.end() if prefix is not None else 0):end].strip()
+    target = javascript_initializer_value_code(binding).strip()
+    if target.startswith(('{', '[')):
+        return javascript_destructuring_declares_root(binding, target, root)
+    reference = re.match(r'[A-Za-z_$][\w$]*', target)
+    return reference is not None and reference.group() == root
+
+def javascript_code_iteration_rebinding(text, code, pairs, root):
+    # of/in assign an existing target without an equals token. Unproved loop
+    # values must not borrow the original parameter or imported CODE identity.
+    for loop in re.finditer(r'\bfor\s*(?:await\s*)?\(', code):
+        start = loop.end()
+        end = pairs.get(start - 1)
+        if end is None:
+            return True
+        split = javascript_code_iteration_split(code, pairs, start, end - 1)
+        if split is not None and javascript_code_iteration_target(text, code, start, split, root):
+            return True
+    return False
+
+
+def javascript_code_destructured_target_write(text, code, start, end, root, owned_declaration):
+    # Annotation members name types; they cannot replace a runtime binding.
+    if any(begin <= start < finish for begin, finish in javascript_binding_annotation_ranges(code)):
+        return False
+    if code[start] not in '{[':
+        return False
+    if owned_declaration and re.search(r'\bconst\s*$', code[:start]):
+        return False
+    return javascript_binding_assignment_end(code, end) is not None and javascript_destructuring_declares_root(text[start:end], code[start:end], root)
+
+
+def javascript_code_unproved_rebinding(text, code, root, owned_declaration=False):
+    pairs = javascript_scope_pairs(code)
+    if pairs is None:
+        return True
+    return javascript_code_destructured_rebinding(text, code, pairs, root, owned_declaration) or javascript_code_iteration_rebinding(text, code, pairs, root)
+
+
+def javascript_code_destructured_rebinding(text, code, pairs, root, owned_declaration=False):
+    # Only the proved original const binding owns its destructuring declaration.
+    # A var declaration can replace a formal; retain that captured body write.
+    return any(javascript_code_destructured_target_write(text, code, start, end, root, owned_declaration)
+               for start, end in pairs.items())
+
+
+def javascript_closed_string_normalizer(parameters, body, root):
+    if re.fullmatch(r'\s*' + re.escape(root) + r'\s*(?::\s*unknown\s*)?', parameters) is None:
+        return False
+    # Only this complete checked primitive body proves a native string result.
+    # Extra writes, callbacks or literal-return branches keep the formal unproved.
+    name = re.escape(root)
+    pattern = (r'\s*if\s*\(\s*typeof\s+' + name + r'\s*!==\s*(["\x27])string\1\s*\)\s*'
+               r'\{\s*return\s+undefined\s*;\s*\}\s*const\s+([A-Za-z_$][\w$]*)\s*=\s*'
+               + name + r'\s*\.\s*trim\s*\(\s*\)\s*;\s*return\s+\2\s*\?\s*\2\s*:\s*undefined\s*;?\s*')
+    return re.fullmatch(pattern, body) is not None
+
+
+def javascript_code_guarded_string_member(text, reference):
+    selected = re.fullmatch(r'([A-Za-z_$][\w$]*)\.trim', reference)
+    if selected is None:
+        return False
+    code = javascript_binding_code(text)
+    declarations = re.finditer(r'\bfunction\s+[A-Za-z_$][\w$]*', code)
+    for declaration in declarations:
+        parts = javascript_local_function_parts(text, code, declaration)
+        if parts is None:
+            continue
+        if javascript_closed_string_normalizer(*parts, selected.group(1)):
+            sources = (text,) + tuple(source for _, source in _CAPTURED_SOURCES.get())
+            return not any(javascript_prototype_writes(source, javascript_binding_code(source)) for source in sources)
+    return False
+
+
+def javascript_code_unproved_callable_invocation(text, reference, called, roles):
+    root = reference.replace('?.', '.').split('.')[0]
+    return bool(called) and (_CAPTURED_SOURCE_PATH.get(), text, root) in roles and not javascript_code_guarded_string_member(text, reference)
+
+
+
+def javascript_code_captured_argument_owner(text, code, opening, module=None, seen=frozenset()):
+    prefix = code[:opening].rstrip()
+    target = re.search(r'(?<![\w$.])([A-Za-z_$][\w$]*)$', prefix)
+    if target is None or re.search(r'\bfunction\s*$', prefix[:target.start()]):
+        return None
+    projected, name = (module, target.group(1)) if module is not None else javascript_scoped_reference_graph(text, target.start(), target.group(1))
+    if name in seen:
+        return None
+    projected_code = javascript_binding_code(projected)
+    declarations = list(re.finditer(r'\bfunction\s+' + re.escape(name) + r'(?![\w$])', projected_code))
+    if len(declarations) == 1:
+        parts = javascript_local_function_parts(projected, projected_code, declarations[0])
+        return (projected, parts) if parts is not None else False
+    if declarations:
+        return False
+    initializers = javascript_binding_initializers(projected, projected_code, name, preserve_callable=True)
+    if len(initializers) != 1:
+        return False if any(re.search(r'\bfunction\b|=>', value) for value in initializers) else None
+    value = initializers[0].strip()
+    if re.fullmatch(r'[A-Za-z_$][\w$]*', value):
+        return javascript_code_captured_argument_owner(value + '(', value + '(', len(value), module=projected, seen=seen | {name})
+    function = re.match(r'(?:async\s+)?function(?:\s+[A-Za-z_$][\w$]*)?', javascript_binding_code(value))
+    if function is not None:
+        parts = javascript_local_function_parts(value, javascript_binding_code(value), function)
+        return (projected, parts) if parts is not None else False
+    arrow = javascript_code_arrow_parts(value)
+    if arrow is None:
+        return False if '=>' in javascript_binding_code(value) else None
+    value_code = javascript_binding_code(value)
+    for marker in re.finditer(r'=>\s*', value_code):
+        start = marker.end()
+        if value_code[start:start + 1] == '{' and javascript_balanced_binding_end(value_code, start, '{', '}') == len(value_code):
+            return projected, (arrow[0], value[start + 1:-1])
+    return projected, (arrow[0], 'return ' + value[value_code.find('=>') + 2:])
+
+
+def javascript_code_argument_selection(argument, aliases):
+    argument = javascript_grouped_reference_code(argument).strip()
+    if not re.fullmatch(URI_CREDENTIAL_REFERENCE_TEXT, argument):
+        return None
+    parts = argument.replace('?.', '.').split('.')
+    selected = aliases.get(parts[0])
+    suffix = parts[1:]
+    return selected[len(suffix):] if selected is not None and selected[:len(suffix)] == suffix else None
+
+
+def javascript_code_selected_alias_paths(text, code, root, selection):
+    # CODE controls can derive primitive values without aliasing their owner.
+    # Follow only reference-preserving paths when checking captured member writes.
+    aliases = {root: selection}
+    pending = [root]
+    while pending:
+        owner = pending.pop()
+        for assignment in javascript_alias_assignments(code):
+            path = javascript_selected_assignment_path(text, assignment, owner, aliases[owner])
+            if path is None:
+                continue
+            if not javascript_add_selected_alias(aliases, pending, assignment.group('alias'), path):
+                return None
+    return aliases
+
+
+def javascript_code_captured_parameter_values(text, code, root, selection, ancestors, module=None, seen=frozenset()):
+    # Runtime parameters add no captured bytes. Local callees can add bytes by
+    # writing the selected member, so retain their writes and actual value inputs.
+    key = (root, tuple(selection))
+    if key in seen:
+        return []
+    if len(seen) >= MAX_JAVASCRIPT_INITIALIZER_ROOTS:
+        return None
+    seen = seen | {key}
+    aliases = javascript_code_selected_alias_paths(text, code, root, selection)
+    context = javascript_selected_argument_context(text, code)
+    if aliases is None or context is None:
+        return None
+    values = []
+    for alias, member in aliases.items():
+        writes = javascript_code_symbol_writes(text, code, alias, member)
+        if writes is None:
+            return None
+        values.extend(writes)
+    for opening, end in context[0]:
+        arguments = split_top_level_call_arguments(text[opening + 1:end - 1])
+        selected = [(i, javascript_code_argument_selection(value, aliases)) for i, value in enumerate(arguments)]
+        selected = [(i, member) for i, member in selected if member]
+        if not selected:
+            continue
+        owner = javascript_code_captured_argument_owner(text, code, opening, module=module)
+        if owner is False:
+            return None
+        if owner is None:
+            continue
+        projected, (parameters, body) = owner
+        formals = javascript_parameter_parts(javascript_binding_code(parameters))
+        body_code = javascript_binding_code(body)
+        for index, member in selected:
+            if index >= len(formals):
+                return None
+            formal = re.match(r'^\s*([A-Za-z_$][\w$]*)\s*(?::|=|$)', formals[index])
+            if formal is None:
+                return None
+            writes = javascript_code_captured_parameter_values(body, body_code, formal.group(1), member, ancestors, module=projected, seen=seen)
+            if writes is None:
+                return None
+            if writes:
+                values.extend(arguments)
+                values.extend(writes)
+    return values
+
+
+def javascript_code_symbol_reference(text, reference, called=False, ancestors=frozenset(), unproved_callables=frozenset(), external_argument=False):
+    # This proves captured source syntax, not the contents or purity of runtime
+    # parameters. Source-owned writes, defaults and captured returns retain all
+    # literal origins. Data objects keep the selected-value/mutation proof.
+    identity = (_CAPTURED_SOURCE_PATH.get(), text, reference, called)
+    if identity in ancestors or len(ancestors) >= MAX_JAVASCRIPT_INITIALIZER_ROOTS:
+        return None
+    ancestors = ancestors | {identity}
+    code = javascript_binding_code(text)
+    parts = reference.replace('?.', '.').split('.')
+    root, selection = parts[0], parts[1:]
+    # This role comes from the exact captured callable header, including arrows.
+    # Unresolved actual arguments cannot establish an invoked formal identity;
+    # they must not borrow the separate direct-runtime-parameter allowance.
+    if javascript_code_unproved_callable_invocation(text, reference, called, unproved_callables):
+        return False
+    global_reference = (SOURCE_CODE_REFERENCE_ROOT_PATTERN.fullmatch(reference) is not None or any(pattern.fullmatch(reference) for pattern in UNQUOTED_SECRET_REFERENCE_PATTERNS)) and not javascript_binding_initializers(text, code, root)
+    destructured = javascript_destructured_binding_initializers(text, code, root)
+    # A const destructuring of a proved code reference retains that source role.
+    # Literal objects, defaults and unresolved carriers cannot borrow it.
+    destructured_symbol = bool(destructured) and not javascript_binding_initializers(text, code, root) and all(
+        re.fullmatch(URI_CREDENTIAL_REFERENCE_TEXT, expression.strip()) is not None
+        and javascript_code_symbol_expression(text, expression, ancestors) is True
+        for expression in destructured)
+    symbolic = javascript_code_parameter(code, root) or javascript_code_imported_name(text, code, root) or global_reference or destructured_symbol
+    writes = (javascript_code_symbol_writes(text, code, root, selection) if symbolic
+              else javascript_selected_alias_writes(text, code, root, selection)) if selection else []
+    if writes is None:
+        return None
+    declarations = list(re.finditer(r'\bfunction\s+' + re.escape(root) + r'(?![\w$])', code))
+    captured_callable = declarations or symbolic or called or external_argument
+    if captured_callable and javascript_code_unproved_rebinding(text, code, root, owned_declaration=destructured_symbol):
+        return False
+    rebindings = javascript_binding_initializers(text, javascript_initializer_value_code(text), root, preserve_callable=bool(called)) if captured_callable else []
+    if rebindings:
+        rebindings = javascript_selected_expressions(rebindings, selection)
+        if rebindings is None:
+            return False
+        # The CODE allowance belongs to the original binding, not captured
+        # replacements. Prove body writes before every binding fast path.
+        replacement = javascript_code_symbol_values(text, rebindings, ancestors, selection[-1] if selection else None, owner=root, called=called, unproved_callables=unproved_callables, external_argument=external_argument)
+        if replacement is not True:
+            return replacement
+    if destructured_symbol:
+        if selection and javascript_selected_mutation_risk(text, code, parts):
+            return False
+        return javascript_code_symbol_values(text, destructured + writes, ancestors, selection[-1] if selection else None, root, called=called, unproved_callables=unproved_callables, external_argument=external_argument)
+    if javascript_code_parameter(code, root):
+        effects = javascript_code_captured_parameter_values(text, code, root, selection, ancestors) if selection else []
+        if effects is None:
+            return False
+        values = javascript_binding_initializers(text, code, root)
+        values = javascript_selected_expressions(values, selection)
+        return javascript_code_symbol_values(text, values + writes + effects, ancestors, selection[-1] if selection else None, root, called=called, unproved_callables=unproved_callables, external_argument=external_argument) if values is not None else None
+    if declarations and selection:
+        # A function object can escape to a captured mutator just like an object.
+        # Prove its selected member before borrowing the return-origin role.
+        if javascript_selected_mutation_risk(text, code, parts):
+            return False
+        origins = javascript_binding_selected_origins(text, code, root, selection, parts)
+        if origins is None:
+            return None
+        return javascript_code_symbol_values(text, origins + writes, ancestors, selected_key=selection[-1], owner=root, called=called, unproved_callables=unproved_callables, external_argument=external_argument)
+    if declarations and not selection:
+        if len(declarations) != 1:
+            return None
+        if not called:
+            return True
+        function = javascript_local_function_parts(text, code, declarations[0])
+        if function is None:
+            return None
+        remaining_calls = max(int(called) - 1, 0)
+        roles = javascript_code_return_parameter_roles(text, function[0], called, unproved_callables)
+        if roles is None:
+            return None
+        result = javascript_code_symbol_values(text, javascript_local_return_origins(*function), ancestors, called=remaining_calls, unproved_callables=roles, external_argument=external_argument)
+        # A captured declaration establishes a code call, not runtime purity.
+        # Keep actual literal/data refusals; unresolved runtime results add no
+        # submitted value bytes to this source reference.
+        return False if result is False else None if remaining_calls and result is None else True
+    if javascript_code_imported_name(text, code, root):
+        binding = javascript_captured_code_import(text, root)
+        if binding is not None and called and not selection:
+            module, original = binding
+            raw = dict(_CAPTURED_SOURCES.get())[module]
+            token = _CAPTURED_SOURCE_PATH.set(module)
+            try:
+                declaration = re.search(r'\bfunction\s+' + re.escape(original) + r'(?![\w$])', javascript_binding_code(raw))
+                position = declaration.end() - len(original) if declaration else 0
+                projected, owned_name = javascript_scoped_reference_graph(raw, position, original)
+                result = javascript_code_symbol_reference(projected, owned_name, called, ancestors)
+            finally:
+                _CAPTURED_SOURCE_PATH.reset(token)
+            if result is not True:
+                return result
+        return javascript_code_symbol_values(text, writes, ancestors, selection[-1] if selection else None, called=called, unproved_callables=unproved_callables, external_argument=external_argument)
+
+    if global_reference:
+        return javascript_code_symbol_values(text, writes, ancestors, selection[-1] if selection else None, called=called, unproved_callables=unproved_callables, external_argument=external_argument)
+    values = javascript_binding_initializers(text, code, root, preserve_callable=bool(called))
+    if not values:
+        # An undeclared external reference submits code, not runtime contents.
+        # Own declarations and unresolved or mutated carriers cannot borrow that
+        # role; retain every captured write before admitting external syntax.
+        if javascript_short_reference_declared(text, code, root) or javascript_unsupported_binding_origin(text, code, root):
+            return False if called else None
+        return javascript_code_symbol_values(text, writes, ancestors, selection[-1] if selection else None, called=called, unproved_callables=unproved_callables, external_argument=external_argument) if called or external_argument else None
+    selected = javascript_selected_expressions(values, selection)
+    if selection:
+        # A property of a source-owned call result is still code syntax. This
+        # does not license own data objects, unknown calls or literal returns.
+        call_pattern = r'\s*(?:await\s+)?[A-Za-z_$][\w$]*(?:(?:\?\.|\.)[A-Za-z_$][\w$]*)*'
+        def source_call(branch):
+            branch_code = javascript_binding_code(branch)
+            callee = re.match(call_pattern, branch_code)
+            suffix = javascript_code_call_suffix(branch_code, callee.end()) if callee else None
+            return suffix is not None and suffix[0]
+        origins = [javascript_code_value_branch_origins(value) for value in values]
+        branches = [branch for value_origins in origins if value_origins is not None for branch in value_origins]
+        call_result = None not in origins and any(source_call(branch) for branch in branches) and all(
+            javascript_code_symbol_expression(text, branch, ancestors, root, unproved_callables=unproved_callables, external_argument=external_argument) is True for branch in branches)
+        if call_result:
+            projection = javascript_code_symbol_values(text, selected + writes, ancestors, selected_key=selection[-1], owner=root, unproved_callables=unproved_callables, external_argument=external_argument) if selected is not None else None
+            if projection is False:
+                return False
+            # CODE origins retain the balanced call and complete returns. DATA
+            # projection otherwise turns a selected result into callee.member.
+            selected = values
+        elif selected is None:
+            literal = any(javascript_expression_has_literal(javascript_origin_selector_text(text, value, root)) for value in values)
+            data = any(javascript_initializer_value_code(value).strip().startswith(('{', '[')) for value in values)
+            return False if literal or data and javascript_binding_literal_risk(text, code, reference) else None
+    # An object literal is data unless selection resolves a positively owned
+    # code symbol. This does not replace its mutable-carrier proof.
+    if not selection and any(javascript_initializer_value_code(value).strip().startswith(('{', '[')) for value in values):
+        # Data origins keep the existing alias/mutation/literal refusal even
+        # when a declaration returns them through a source-code call.
+        return False if javascript_binding_literal_risk(text, code, root) else None
+    object_member = bool(selection) and any(javascript_initializer_value_code(value).strip().startswith('{') for value in values)
+    callable_member = object_member and javascript_code_callable_selection(text, code, parts, selected)
+    if object_member and called and not callable_member:
+        return False if javascript_binding_literal_risk(text, code, reference) else None
+    if selection and not callable_member and javascript_selected_mutation_risk(text, code, parts):
+        # Resolved aliases and call results keep captured mutation/escape checks.
+        return False
+    return javascript_code_symbol_values(text, selected + writes, ancestors, owner=root, called=called, unproved_callables=unproved_callables, external_argument=external_argument or object_member and not called and not callable_member)
+
+
+
+
+
+
+
+
+
+
+
+
+
+def javascript_code_symbol_values(text, expressions, ancestors, selected_key=None, owner=None, called=False, unproved_callables=frozenset(), external_argument=False):
+    decisions = []
+    for expression in expressions:
+        literal = re.fullmatch(r'\s*(["\x27])([A-Za-z0-9_-]+)\1\s*', expression)
+        # Fixture approval belongs to this exact selected origin. Invoked aliases
+        # otherwise retain call context through the common expression owner.
+        if selected_key and literal and synthetic_secret_fixture(literal.group(2), selected_key):
+            decisions.append(True)
+        else:
+            decisions.append(javascript_code_symbol_expression(text, expression, ancestors, owner, called=called, unproved_callables=unproved_callables, external_argument=external_argument))
+    return javascript_code_decisions(decisions)
+
+
+
+
+def javascript_grouped_reference_code(expression):
+    # The existing selector owner preserves offsets. Transfer only its actual
+    # code-span changes, leaving strings, templates, regexes and comments raw.
+    expression = javascript_inline_type_text(expression)
+    code = javascript_binding_code(expression)
+    selected = javascript_initializer_value_code(expression)
+    return ''.join(selected[index] if char != selected[index] else expression[index]
+                   for index, char in enumerate(code))
+
+
+def javascript_code_arrow_origins(expression):
+    parts = javascript_code_arrow_parts(expression)
+    return None if parts is None else parts[1]
+
+
+def javascript_code_module_selector_text(expression):
+    # Only a literal relative module specifier at the import keyword is code
+    # metadata. Never erase URI, encoded, constructed or opaque value origins.
+    pattern = re.compile(r'''\bimport\s*\(\s*(?P<q>["'])(?P<path>(?:\.{1,2}/)+(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:js|ts|mjs|cjs))(?P=q)\s*\)''')
+    code = javascript_binding_code(expression)
+    spans = [match.span() for match in pattern.finditer(expression)
+             if code[match.start():match.start() + 6] == "import"
+             and not any(documentation_component_risk(part) for part in match.group("path").split("/"))]
+    return javascript_selector_literal_mask(expression, spans)
+
+
+
+def javascript_code_decisions(decisions):
+    return False if False in decisions else None if None in decisions else True
+
+
+def javascript_code_conditional_values(text, branches, ancestors, called, unproved_callables=frozenset(), external_argument=False):
+    # The selector chooses a callable; it is not itself invoked. Preserve the
+    # invoked identity only on value branches, including nested conditionals.
+    selector = javascript_code_symbol_expression(text, branches[0], ancestors, unproved_callables=unproved_callables, external_argument=True)
+    values = javascript_code_symbol_values(text, branches[1:], ancestors, called=called, unproved_callables=unproved_callables, external_argument=external_argument)
+    return javascript_code_decisions((selector, values))
+
+
+def javascript_code_value_branch_origins(expression, depth=0):
+    # Project possible values without treating selectors as receiver identities.
+    # Raw literals remain in each branch for the common value-origin scan.
+    if depth >= MAX_JAVASCRIPT_INITIALIZER_ROOTS:
+        return None
+    value = javascript_grouped_reference_code(expression).strip()
+    code = javascript_binding_code(value)
+    if code.startswith('(') and javascript_balanced_binding_end(code, 0, '(', ')') == len(code):
+        return javascript_code_value_branch_origins(value[1:-1], depth + 1)
+    conditional = javascript_conditional_value_origins(value, [])
+    branches = conditional[1:] if conditional is not None else javascript_selected_nullable_origins(value, [], depth)
+    if branches is None:
+        return [value]
+    origins = [javascript_code_value_branch_origins(branch, depth + 1) for branch in branches]
+    return None if None in origins else [value for branch in origins for value in branch]
+
+
+def javascript_code_call_argument_spans(code, roots):
+    # Only syntactic call arguments get the external-code role. A bare undeclared
+    # credential reference cannot borrow it, nor can an owned data initializer.
+    spans = []
+    for root in roots:
+        cursor = root.end()
+        for _ in range(MAX_JAVASCRIPT_INITIALIZER_ROOTS):
+            part = javascript_code_call_part(code, cursor)
+            if part is None or part[0] is None:
+                break
+            end, type_span = part
+            opening = code.find('(', type_span[1] if type_span is not None else cursor, end)
+            if opening >= 0:
+                spans.append((opening + 1, end - 1))
+            cursor = end
+    return spans
+
+
+def javascript_code_callable_value_root(code):
+    # A prefix cannot prove a callable value: operators can select another
+    # function. Consume the complete supported reference/call grammar instead.
+    root = re.match(r'\s*(?:await\s+)?(?P<root>[A-Za-z_$][\w$]*(?:(?:\?\.|\.)[A-Za-z_$][\w$]*)*)', code)
+    if root is None:
+        return None
+    cursor = root.end()
+    for _ in range(MAX_JAVASCRIPT_INITIALIZER_ROOTS):
+        part = javascript_code_call_part(code, cursor)
+        if part is None:
+            return None
+        end, _ = part
+        if end is None:
+            return root if not code[cursor:].strip() else None
+        cursor = end
+    return None
+
+
+def javascript_code_return_parameter_roles(text, parameters, called, inherited):
+    if not called:
+        return inherited
+    code = javascript_binding_code(parameters)
+    bindings = javascript_parameter_bindings(code, 0, len(code))
+    if bindings is None or len(bindings) > MAX_JAVASCRIPT_INITIALIZER_ROOTS:
+        return None
+    return inherited | frozenset((_CAPTURED_SOURCE_PATH.get(), text, name) for _, name in bindings)
+
+
+def javascript_code_arrow_parts(expression):
+    # A typed arrow header names a function. Only its actual returned expression
+    # carries value bytes; module selectors retain their separate literal scan.
+    raw = expression.strip()
+    code = javascript_binding_code(raw)
+    header = re.match(r"(?:async\s*)?\(", code)
+    if header is None:
+        return None
+    end = javascript_balanced_binding_end(code, header.end() - 1, "(", ")")
+    if end is None:
+        return None
+    cursor = end + len(code[end:]) - len(code[end:].lstrip())
+    if code[cursor:cursor + 1] == ":":
+        cursor += 1
+        while cursor < len(code) and cursor - end <= 8192:
+            cursor += len(code[cursor:]) - len(code[cursor:].lstrip())
+            if code[cursor:cursor + 2] == "=>":
+                break
+            token_end = javascript_type_token_end(code, cursor)
+            if token_end is None:
+                return None
+            cursor = token_end
+    if code[cursor:cursor + 2] != "=>":
+        return None
+    body = raw[cursor + 2:].strip()
+    if body.startswith("{"):
+        body_code = javascript_binding_code(body)
+        return (raw[header.end():end - 1], javascript_local_return_origins(raw[header.end():end - 1], body[1:-1])) if javascript_balanced_binding_end(body_code, 0, "{", "}") == len(body_code) else None
+    return (raw[header.end():end - 1], [body]) if body else None
+
+def javascript_code_callable_group_origin(expression):
+    for _ in range(MAX_JAVASCRIPT_INITIALIZER_ROOTS):
+        expression = expression.strip()
+        code = javascript_binding_code(expression)
+        if not code.startswith('('):
+            return expression
+        end = javascript_balanced_binding_end(code, 0, '(', ')')
+        if end is None:
+            return None
+        if end != len(code):
+            return expression
+        expression = expression[1:-1]
+    return None
+
+
+def javascript_code_call_type_span(code, cursor):
+    if code[cursor:cursor + 1] != '<':
+        return cursor, None
+    end = javascript_type_token_end(code, cursor)
+    return None if end is None or end - cursor > 8192 else (end, (cursor, end))
+
+
+def javascript_code_call_arguments(code, cursor, type_span, optional):
+    cursor += len(code[cursor:]) - len(code[cursor:].lstrip())
+    if code[cursor:cursor + 1] != '(':
+        return None if optional or type_span else (None, None)
+    end = javascript_balanced_binding_end(code, cursor, '(', ')')
+    return None if end is None else (end, type_span)
+
+
+def javascript_code_call_part(code, cursor):
+    cursor += len(code[cursor:]) - len(code[cursor:].lstrip())
+    optional = code[cursor:cursor + 2] == '?.'
+    if optional:
+        cursor += 2
+        cursor += len(code[cursor:]) - len(code[cursor:].lstrip())
+    typed = javascript_code_call_type_span(code, cursor)
+    return None if typed is None else javascript_code_call_arguments(code, typed[0], typed[1], optional)
+
+
+def javascript_code_call_continuation(code, cursor, depth):
+    # A post-call member selector remains the selected-value owner's concern.
+    # Count only actual subsequent invocation syntax here.
+    if re.match(r'\s*(?:\?\.\s*)?[<(]', code[cursor:]) is None:
+        return 0, None
+    return javascript_code_call_suffix(code, cursor, depth)
+
+
+def javascript_code_call_suffix(code, cursor, depth=0):
+    # Consecutive calls consume returned callable identities. The same bounded
+    # suffix owner keeps optional/type syntax from dropping an invocation layer.
+    if depth >= MAX_JAVASCRIPT_INITIALIZER_ROOTS:
+        return None
+    part = javascript_code_call_part(code, cursor)
+    if part is None:
+        return None
+    end, type_span = part
+    if end is None:
+        return 0, None
+    remaining = javascript_code_call_continuation(code, end, depth + 1)
+    return None if remaining is None else (1 + remaining[0], type_span)
+
+
+def javascript_code_symbol_expression(text, expression, ancestors=frozenset(), owner=None, called=False, unproved_callables=frozenset(), external_argument=False):
+    expression = javascript_code_callable_group_origin(expression)
+    if expression is None:
+        return None
+    expression = javascript_origin_selector_text(text, expression, owner)
+    arrow = javascript_code_arrow_parts(expression)
+    if arrow is not None:
+        roles = javascript_code_return_parameter_roles(text, arrow[0], called, unproved_callables)
+        return None if roles is None else javascript_code_symbol_values(text, arrow[1], ancestors, owner=owner, called=max(int(called) - 1, 0), unproved_callables=roles, external_argument=external_argument)
+    expression = javascript_code_module_selector_text(expression)
+    expression = javascript_grouped_reference_code(expression)
+    branches = javascript_conditional_value_origins(expression, [])
+    if branches is not None:
+        return javascript_code_conditional_values(text, branches, ancestors, called, unproved_callables)
+    nullable = javascript_selected_nullable_origins(expression, [], 0)
+    if nullable is not None:
+        # Keep nested selector ownership while both possible values retain
+        # the same invocation and literal-origin checks.
+        return javascript_code_symbol_values(text, nullable, ancestors, owner=owner, called=called, unproved_callables=unproved_callables, external_argument=external_argument)
+    if javascript_syntax_boolean_expression(expression):
+        return True
+    if expression.strip() == '{}' or re.fullmatch(r'\s*(?:null|undefined|true|false|[+-]?(?:[0-9]+(?:\.[0-9]+)?))\s*', expression):
+        return True
+    if javascript_expression_has_literal(expression):
+        return False
+    code = javascript_grouped_reference_code(expression)
+    roots = list(re.finditer(r'(?<![\w$.])(?P<root>[A-Za-z_$][\w$]*(?:(?:\?\.|\.)[A-Za-z_$][\w$]*)*)', code))
+    if not roots or len(roots) > 2 * MAX_JAVASCRIPT_INITIALIZER_ROOTS:
+        return False
+    # External reference leaves carry no captured values to expand. Keep the
+    # original bound for owned declarations and a separate bounded lexical scan.
+    source_code = javascript_binding_code(text)
+    owned_roots = {root.group('root').replace('?.', '.').split('.')[0] for root in roots}
+    if sum(javascript_short_reference_declared(text, source_code, root) for root in owned_roots) > MAX_JAVASCRIPT_INITIALIZER_ROOTS:
+        return False
+    value_root = javascript_code_callable_value_root(code) if called else None
+    if called and value_root is None:
+        return False
+    argument_spans = javascript_code_call_argument_spans(code, roots)
+    decisions, type_spans = [], []
+    for root in roots:
+        if any(start <= root.start() < end for start, end in type_spans):
+            continue
+        if javascript_initializer_object_key(code, root) or root.group() in {'typeof', 'await', 'void'} or (root.group() == 'import' and re.match(r'\s*\(\s*null\s*\)', code[root.end():])):
+            continue
+        suffix = javascript_code_call_suffix(code, root.end())
+        if suffix is None:
+            return None
+        calls, type_span = suffix
+        if type_span is not None:
+            type_spans.append(type_span)
+        # Only the initializer's value callee inherits the outer invocation.
+        # Argument references and conditional selectors are not called by it.
+        if value_root is not None and root.start() == value_root.start('root'):
+            calls += int(called)
+        decisions.append(javascript_code_symbol_reference(text, root.group(), calls, ancestors, unproved_callables=unproved_callables, external_argument=external_argument or any(start <= root.start() < end for start, end in argument_spans)))
+    return javascript_code_decisions(decisions)
+
+
+
+
+
+
+
+def javascript_code_parameter_occurrence(text, start, expression):
+    # An unrelated overload can leave the module graph unproved. Reuse the
+    # complete enclosing function's lexical graph for this exact source read.
+    # Defaults, shadowed locals and writes still pass the same value checks.
+    if re.fullmatch(URI_CREDENTIAL_REFERENCE_TEXT, expression.strip()) is None:
+        return None
+    code = javascript_binding_code(text)
+    position = start + len(text[start:]) - len(text[start:].lstrip())
+    if code[position:position + len(expression.strip())] != expression.strip():
+        return None
+    pairs = javascript_scope_pairs(code)
+    if pairs is None:
+        return None
+    owners = []
+    declarations = re.finditer(r'\bfunction(?![\w$])\s*\*?\s*(?P<name>[A-Za-z_$][\w$]*)?', code)
+    for declaration in declarations:
+        scope = javascript_declared_function_scope(code, pairs, declaration)
+        if scope is not None:
+            body, parameters = scope
+            if body < start < pairs.get(body, body):
+                owners.append((body, declaration.start(), pairs[body]))
+    if not owners:
+        return None
+    _, begin, end = max(owners)
+    fragment = text[begin:end]
+    if javascript_scope_graph_replacements(fragment) is None:
+        return None
+    position = start + len(text[start:]) - len(text[start:].lstrip()) - begin
+    projected, reference = javascript_scoped_reference_graph(fragment, position, expression.strip())
+    return javascript_code_symbol_expression(projected, reference)
+
+
+
+
+def javascript_scoped_code_expression(text, start, expression):
+    expression = javascript_length_comparison_text(javascript_origin_selector_text(text, expression))
+    code = javascript_grouped_reference_code(expression)
+    roots = list(re.finditer(r'(?<![\w$.])(?P<root>[A-Za-z_$][\w$]*(?:(?:\?\.|\.)[A-Za-z_$][\w$]*)*)', javascript_initializer_value_code(code)))
+    if len(roots) > MAX_JAVASCRIPT_INITIALIZER_ROOTS:
+        return None
+    scoped, _ = javascript_scoped_reference_graph(text, start, 'undefined')
+    original, cursor, replacements = javascript_binding_code(text), start, []
+    for root in roots:
+        if javascript_initializer_object_key(code, root) or root.group() in {'typeof', 'await', 'void', 'null', 'undefined', 'true', 'false'}:
+            continue
+        value = root.group()
+        base = value.replace('?.', '.').split('.')[0]
+        position = original.find(base, cursor, start + 8192)
+        if position < 0:
+            return None
+        _, selected = javascript_scoped_reference_graph(text, position, value)
+        replacements.append((root.start(), root.end(), selected))
+        cursor = position + len(base)
+    for begin, end, selected in reversed(replacements):
+        code = code[:begin] + selected + code[end:]
+    result = javascript_code_symbol_expression(scoped, code)
+    return javascript_code_parameter_occurrence(text, start, expression) if result is None else result
+
+
+
+
+def javascript_scoped_value_reference(text, start, value) -> bool:
+    scoped, selected = javascript_scoped_reference_graph(text, start, value)
+    owned = javascript_code_symbol_expression(scoped, selected)
+    if owned is None:
+        owned = javascript_code_parameter_occurrence(text, start, value)
+    return owned if owned is not None else not javascript_binding_literal_risk(scoped, javascript_binding_code(scoped), selected.replace("?.", "."))
+
+
+
+def javascript_binding_proven_references(text, code, expressions, owner=None) -> set[str] | None:
+    expressions = [javascript_origin_selector_text(text, expression, owner)
+                   for expression in expressions if not javascript_imported_entropy_origin(text, code, expression)]
     if any(javascript_expression_has_literal(expression) for expression in expressions):
         return None
     return set().union(*(javascript_initializer_references(expression) for expression in expressions))
@@ -4531,21 +7141,36 @@ def javascript_entropy_namespace_intact(text, code, root, import_position: int) 
 
 def javascript_binding_literal_risk(text: str, code: str, root: str) -> bool:
     # A declared root can hide literal bytes behind aliases or later assignments.
-    # Cycles and exhausted bounds cannot establish a safe reference allowance.
+    # Count value-bearing expansions; an empty imported/parameter reference
+    # has no local value to expand. Cycles and the expansion cap still refuse.
     pending = [(root, frozenset())]
     checked: set[str] = set()
+    expanded: set[str] = set()
     while pending:
         root, ancestors = pending.pop()
         if root in ancestors:
             return True
         if root in checked:
             continue
-        links = javascript_binding_links(text, code, root, len(checked))
+        links = javascript_bounded_value_links(text, code, root, len(expanded))
         if links is None:
             return True
         checked.add(root)
+        javascript_record_value_expansion(expanded, root, links)
         pending.extend((reference, ancestors | {root}) for reference in sorted(links))
     return False
+
+
+
+def javascript_record_value_expansion(expanded, root, links) -> None:
+    if links:
+        expanded.add(root)
+
+
+def javascript_bounded_value_links(text, code, root, expanded_count) -> set[str] | None:
+    links = javascript_binding_links(text, code, root, 0)
+    return None if links and expanded_count >= MAX_JAVASCRIPT_INITIALIZER_ROOTS else links
+
 
 def javascript_source_whitespace(char: str) -> bool:
     return (
@@ -4684,19 +7309,115 @@ def bare_code_reference(
     )
 
 def python_control_reference_ranges(text: str) -> tuple[tuple[int, int], ...]:
-    headers = tuple(re.finditer(
-        r"(?m)^[ \t]*(?:if|elif|while)[ \t]+(?:not[ \t]+)?"
-        r"(?P<reference>[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)"
-        r"[ \t]*(?P<colon>:)[ \t]*(?:#[^\r\n]*)?\r?$", text,
-    ))
-    contexts = string_contexts_at(text, {header.start("reference") for header in headers})
-    # A control-header colon does not assign the next line to its condition.
-    # Mask only the reference/header colon; rescan the untouched body for secrets.
-    return tuple(
-        (header.start("reference"), header.end("colon"))
-        for header in headers
-        if contexts[header.start("reference")] is None
-    )
+    # A proved control-header colon never assigns its following body. Keep all
+    # condition and body bytes in the credential scan, including walrus writes.
+    rows = re.finditer(r"(?m)^[ \t]*(?:if|elif|while)[ \t]+[^\r\n]{1,8192}:[ \t]*(?:#[^\r\n]*)?\r?$", text)
+    return tuple(span for row in rows if (span := python_control_header_colon(text, row)) is not None) + python_annotated_scalar_ranges(text)
+
+
+def python_annotated_scalar_ranges(text):
+    # Only parsed annotations with no credential data receive this syntax role.
+    # Strings, calls and adjacent assignments keep their original value scan.
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError):
+        return ()
+    return tuple(span for node in ast.walk(tree)
+                 for span in python_annotated_node_ranges(text, node))
+
+def python_annotated_node_ranges(text, node):
+    return tuple(span for target, annotation, value in python_annotated_node_values(node)
+                 if (span := python_annotated_scalar_span(text, target, annotation, value)) is not None)
+
+
+def python_annotated_node_values(node):
+    # Positional defaults align to the last arguments; keyword-only defaults
+    # retain their own slots. Both allowance and refusal scan these same values.
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        args = node.args.posonlyargs + node.args.args
+        defaults = [None] * (len(args) - len(node.args.defaults)) + node.args.defaults
+        pairs = list(zip(args, defaults)) + list(zip(node.args.kwonlyargs, node.args.kw_defaults))
+        return tuple((arg, arg.annotation, value) for arg, value in pairs if arg.annotation is not None)
+    if isinstance(node, ast.AnnAssign):
+        return ((node.target, node.annotation, node.value),)
+    return ()
+
+def python_annotation_reference_type(annotation):
+    allowed = (ast.Name, ast.Attribute, ast.Subscript, ast.Tuple, ast.Load, ast.BinOp, ast.BitOr)
+    return annotation is not None and all(isinstance(node, allowed) for node in ast.walk(annotation))
+
+def python_annotation_boolean_type(annotation):
+    if isinstance(annotation, ast.Name):
+        return annotation.id == 'bool'
+    return isinstance(annotation, ast.Subscript) and isinstance(annotation.slice, ast.Name) and annotation.slice.id == 'bool'
+
+def python_annotated_scalar_value(annotation, value):
+    if value is None:
+        return True
+    if not isinstance(value, ast.Constant):
+        return False
+    return value.value is None or isinstance(value.value, bool) and python_annotation_boolean_type(annotation)
+
+def python_annotated_scalar_span(text, target, annotation, value):
+    if not python_annotation_reference_type(annotation) or not python_annotated_scalar_value(annotation, value):
+        return None
+    start = python_literal_source_position(text, target)
+    end = python_literal_source_position(text, annotation)
+    if end - start > 8192:
+        return None
+    prefix = SECRET_ASSIGNMENT_PREFIX_PATTERN.search(text, start, end)
+    return prefix.span() if prefix is not None and prefix.group().rstrip().endswith(':') else None
+
+def python_annotated_assignment_literal_risk(text):
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError):
+        return False
+    return any(python_annotated_credential_value_risk(text, target, annotation, value)
+               for node in ast.walk(tree)
+               for target, annotation, value in python_annotated_node_values(node))
+
+def python_annotated_assignment_key(target):
+    if isinstance(target, ast.arg):
+        return target.arg
+    if isinstance(target, ast.Name):
+        return target.id
+    if isinstance(target, ast.Attribute):
+        return target.attr
+    return None
+
+
+def python_annotated_credential_value_risk(text, target, annotation, value):
+    if python_annotated_scalar_value(annotation, value):
+        return False
+    key = python_annotated_assignment_key(target)
+    if key is None or SECRET_ASSIGNMENT_PREFIX_PATTERN.fullmatch(key + " = ") is None:
+        return False
+    source = ast.get_source_segment(text, value)
+    # A type name must never replace a credential value in the refusal check.
+    # Function defaults and annotated assignments share this actual-value owner.
+    return source is None or len(source) > 8192 or secret_text_risk(key + " = " + source, python_source=True)
+
+def python_control_header_colon(text, row):
+    header = row.group().strip()
+    if header.startswith("elif "):
+        header = "if " + header[5:]
+    try:
+        tree = ast.parse(header + "\n    pass")
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+    if len(tree.body) != 1 or not isinstance(tree.body[0], (ast.If, ast.While)):
+        return None
+    colon = row.start() + row.group().rfind(":", 0, row.group().find("#") if "#" in row.group() else len(row.group()))
+    return python_control_prefix_span(text, row, colon)
+
+def python_control_prefix_span(text, row, colon):
+    if string_contexts_at(text, {colon})[colon] is not None:
+        return None
+    prefixes = SECRET_ASSIGNMENT_PREFIX_PATTERN.finditer(row.group())
+    return next(((row.start() + p.start(), colon + 1) for p in prefixes
+                 if p.end() >= colon - row.start() + 1 and p.group().rstrip().endswith(":")), None)
+
 
 def python_assignment_in_code(text: str, position: int) -> bool:
     line_start = text.rfind("\n", 0, position) + 1
@@ -5260,6 +7981,9 @@ def python_reviewed_literal_prefixes(text: str, contexts, depth: int) -> set[int
         payload = python_source_literal_value(python_source_literal_token(text, context))
         if payload is None:
             continue
+        if python_fixture_literal_owned(text, context, payload):
+            reviewed.update(positions)
+            continue
         # Recheck all decoded content inside this delimiter before reviewing
         # its prefixes. Eight quoting layers bound repeated decoding work.
         if depth >= 8:
@@ -5268,6 +7992,7 @@ def python_reviewed_literal_prefixes(text: str, contexts, depth: int) -> set[int
             return None
         reviewed.update(positions)
     return reviewed
+
 
 def python_null_uuid_operands(zero: ast.AST, count: ast.AST) -> bool:
     return all((
@@ -5550,10 +8275,30 @@ def python_bound_resolver_assignment(text: str, prefix, positions: set[int]) -> 
     )
 
 
+def python_named_assignment_literal_risk(text) -> bool:
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError):
+        return False
+    return any(python_named_credential_value_risk(text, node) for node in ast.walk(tree) if isinstance(node, ast.NamedExpr))
+
+
+def python_named_credential_value_risk(text, node) -> bool:
+    assignment = node.target.id + " = "
+    if SECRET_ASSIGNMENT_PREFIX_PATTERN.fullmatch(assignment) is None:
+        return False
+    value = ast.get_source_segment(text, node.value)
+    return value is None or secret_text_risk(assignment + value, python_source=True)
+
+
+def python_reviewed_reference_prefixes(text, contexts, depth):
+    return None if python_named_assignment_literal_risk(text) else python_reviewed_literal_prefixes(text, contexts, depth)
+
+
 def python_source_reference_preflight(text: str, assignment_prefixes, depth: int) -> set[int] | None:
     contexts = string_contexts_at(text, {prefix.start() for prefix in assignment_prefixes})
-    references = python_reviewed_literal_prefixes(text, contexts, depth)
-    if references is None:
+    references = python_reviewed_reference_prefixes(text, contexts, depth)
+    if any((references is None, python_annotated_assignment_literal_risk(text))):
         return None
     literal_prefixes = python_literal_prefix_index(contexts)
     keyword_starts, fixture_starts = python_assignment_statement_starts(text, assignment_prefixes)
@@ -5628,6 +8373,82 @@ def documentation_comment_reference_ranges(text: str) -> tuple[tuple[int, int], 
                  for prefix in SECRET_ASSIGNMENT_PREFIX_PATTERN.finditer(text)
                  if documentation_comment_reference(text, prefix))
 
+def javascript_sequential_redaction_fixture_ranges(text, dialect):
+    if dialect is None:
+        return ()
+    # A fixed alphabet/count sequence plus an actual negative redaction assertion
+    # identifies test data. Changed payloads and assertion text in comments fail.
+    value = "sk-or-v1-" + "abcdef" + "0123456789"
+    if not javascript_negative_redaction_assertion(text, value):
+        return ()
+    matches = tuple(re.finditer(re.escape(value) + r"(?![\w-])", text))
+    contexts = string_contexts_at(text, {m.start() for m in matches})
+    return tuple(span for m in matches if (span := javascript_redaction_fixture_span(text, m, contexts[m.start()])) is not None)
+
+
+def javascript_negative_redaction_assertion(text, value):
+    assertion = re.compile(r"\bexpect\([^()\r\n]{1,256}\)\.not\.toContain\(\s*([\"'])" + re.escape(value) + r"\1\s*\)")
+    code = javascript_binding_code(text)
+    return any(code[m.start():m.start() + 6] == "expect" for m in assertion.finditer(text))
+
+
+def javascript_redaction_fixture_span(text, match, context):
+    if context is None or text[match.end():match.end() + 1] != context[0]:
+        return None
+    suffix = text[match.end() + 1:].lstrip()
+    if not suffix.startswith((")", ",", ";")):
+        return None
+    prefix = javascript_redaction_fixture_prefix(text, context[1], match.start())
+    return (prefix.start() if prefix is not None else match.start(), match.end())
+
+
+def javascript_redaction_fixture_prefix(text, start, end):
+    return next((p for p in SECRET_ASSIGNMENT_PREFIX_PATTERN.finditer(text, start, end) if p.end() == end), None)
+
+
+def secret_assignment_suffix_text(text, prefix):
+    context = string_contexts_at(text, {prefix.start()})[prefix.start()]
+    if context is None:
+        return text[prefix.end():]
+    token = python_source_literal_token(text, context)
+    if token is None:
+        return text[prefix.end():]
+    quote, start = context
+    end = start + len(token) - token.index(quote) - len(quote)
+    return text[prefix.end():end]
+
+
+def javascript_reference_prefix_literal_risk(text, prefix, dialect) -> bool:
+    if dialect is None:
+        return False
+    selected = javascript_reference_assignment_expression(text, javascript_binding_code(text), prefix)
+    if selected is None:
+        return False
+    # A declined conditional proof must keep its literal refusal. Its raw
+    # suffix cannot recover a scoped value hidden behind another operand.
+    if len(selected) > 8192:
+        return True
+    if javascript_expression_has_literal(selected):
+        return False
+    return not javascript_proven_reference_expression(text, prefix.end(), selected)
+
+def short_bare_secret_reference(match, value) -> bool:
+    return match.group("bare_value") is not None and len(value) < 12 and re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$]*", value) is not None
+
+def safe_short_secret_reference(text, match, value, dialect) -> bool:
+    if not safe_secret_assignment_suffix(text, match.end(), javascript_dialect=dialect):
+        return False
+    if dialect is None:
+        return True
+    code = javascript_binding_code(text)
+    # A short name is still a value origin when source declares it. Follow
+    # that binding through the same bounded graph as longer references so
+    # aliases cannot hide credential bytes behind the spelling length.
+    return not javascript_short_reference_declared(text, code, value) or declared_javascript_secret_reference(text, match.end() - len(value), value)
+
+def javascript_short_reference_declared(text, code, value) -> bool:
+    return re.search(r"\b(?:const|let|var)\s+" + re.escape(value) + r"(?![\w$])", code) is not None or javascript_parameter_declared(code, value) or bool(javascript_destructured_binding_initializers(text, code, value))
+
 def secret_text_risk(
     text: str,
     *,
@@ -5638,23 +8459,26 @@ def secret_text_risk(
     _python_literal_depth: int = 0,
 ) -> bool:
     uri_authorities = uri_authority_ranges(text)
-    if credentialed_uri_risk(text, uri_authorities, compose_source=compose_source) or basic_authorization_risk(text) or any(
-        pattern.search(text) for pattern in SECRET_VALUE_PATTERNS
-    ):
+    fixture_ranges = javascript_sequential_redaction_fixture_ranges(text, javascript_dialect)
+    fixture_scan_text = mask_ranges(text, fixture_ranges)
+    if credentialed_uri_risk(text, uri_authorities, compose_source=compose_source) or basic_authorization_risk(text) or captured_fixture_secret_value_risk(fixture_scan_text):
         return True
     safe_assignment_ranges = interpolated_empty_password_uri_ranges(
         text,
         uri_authorities,
     )
+    safe_assignment_ranges += fixture_ranges
     safe_assignment_ranges += shell_environment_selector_ranges(text)
     safe_assignment_ranges += documentation_comment_reference_ranges(text)
     safe_assignment_ranges += typescript_type_reference_ranges(text, javascript_dialect)
+
     if compose_source:
         safe_assignment_ranges += compose_required_uri_variable_ranges(text, uri_authorities)
         safe_assignment_ranges += compose_environment_reference_ranges(text)
         safe_assignment_ranges += compose_mount_reference_ranges(text)
     if python_source:
-        safe_assignment_ranges += python_control_reference_ranges(text)
+        safe_assignment_ranges += python_control_reference_ranges(text) + python_fixture_prefix_ranges(text)
+    safe_assignment_ranges += javascript_source_assignment_ranges(text, javascript_dialect, safe_assignment_ranges)
     assignment_scan_text = mask_ranges(text, safe_assignment_ranges)
     assignment_prefixes = secret_assignment_matches(
         SECRET_ASSIGNMENT_PREFIX_PATTERN,
@@ -5679,8 +8503,17 @@ def secret_text_risk(
     for prefix in assignment_prefixes:
         if prefix.start() in python_references:
             continue
+        if javascript_dialect is not None:
+            code = javascript_binding_code(text)
+            if code[prefix.start():prefix.end()] == prefix.group():
+                expression = fallback_expression(text[prefix.end():], typescript=True)
+                if not javascript_expression_has_literal(expression) and javascript_scoped_code_expression(text, prefix.end(), expression) is False:
+                    return True
+
+        if javascript_reference_prefix_literal_risk(text, prefix, javascript_dialect):
+            return True
         fallback = top_level_fallback_suffix(
-            text[prefix.end() :],
+            secret_assignment_suffix_text(text, prefix),
             allow_chained_assignment=(
                 re.search(r"=(?!=|>)\s*$", prefix.group(0)) is not None
                 and prefix.start() in chained_assignment_positions
@@ -5778,16 +8611,8 @@ def secret_text_risk(
             ):
                 continue
             return True
-        if (
-            match.group("bare_value") is not None
-            and len(value) < 12
-            and re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$]*", value)
-        ):
-            if safe_secret_assignment_suffix(
-                text,
-                match.end(),
-                javascript_dialect=javascript_dialect,
-            ):
+        if short_bare_secret_reference(match, value):
+            if safe_short_secret_reference(text, match, value, javascript_dialect):
                 continue
             return True
         if (
@@ -5882,6 +8707,8 @@ def secret_text_risk(
             return True
         return True
     return False
+
+
 
 def require_no_secret_values(
     label: str,
@@ -6076,8 +8903,51 @@ def json_member_risk(key: str, value: Any, depth: int) -> bool:
     return json_value_risk(value, depth + 1)
 
 
+def json_bound_source_path(value):
+    # A complete captured-source record supplies its language and exact bytes.
+    # Duplicate members and unbound strings retain ordinary decoded-data checks.
+    if len(value) != 4 or {key for key, _ in value} != {"path", "bytes", "sha256", "source"}:
+        return None
+    fields = dict(value)
+    if not all(isinstance(fields[key], str) for key in ("path", "source", "sha256")):
+        return None
+    return json_valid_source_binding(fields)
+
+
+def json_valid_source_binding(fields):
+    path, source = fields["path"], fields["source"]
+    if javascript_review_dialect(path) is None and Path(path).suffix != ".py":
+        return None
+    data = json_source_utf8_bytes(source)
+    if data is None or not json_source_content_matches(fields, data):
+        return None
+    return path
+
+
+def json_source_utf8_bytes(source):
+    try:
+        return source.encode("utf-8")
+    except UnicodeError:
+        return None
+
+
+def json_source_content_matches(fields, data) -> bool:
+    return isinstance(fields["bytes"], JsonNumber) and fields["bytes"] == str(len(data)) and fields["sha256"] == hashlib.sha256(data).hexdigest()
+
+
+def json_bound_source_member_risk(key, child, depth, source_path):
+    if key != "source" or source_path is None:
+        return json_member_risk(key, child, depth)
+    try:
+        require_safe_source("captured source", source_path, child)
+    except SystemExit:
+        return True
+    return False
+
+
 def json_members_risk(value: JsonObjectMembers, depth: int) -> bool:
-    return any(json_member_risk(key, child, depth) for key, child in value)
+    source_path = json_bound_source_path(value)
+    return any(json_bound_source_member_risk(key, child, depth, source_path) for key, child in value)
 
 
 def json_list_risk(value: list, depth: int) -> bool:
@@ -6117,13 +8987,17 @@ def require_safe_source(label: str, rel: str, text: str) -> None:
             raise SystemExit('refusing to include secret-like content in review bundle; '
                              f'clean or redact {label} before running autoreview')
         return
-    require_no_secret_values(
-        label, text,
-        javascript_dialect=javascript_review_dialect(rel),
-        go_source=Path(rel).suffix == ".go",
-        compose_source=compose_review_path(rel),
-        python_source=Path(rel).suffix == ".py",
-    )
+    token = _PYTHON_FIXTURE_PLACEHOLDERS.set(python_captured_fixture_placeholders(text) if Path(rel).suffix == '.py' else None)
+    source_token = _CAPTURED_SOURCE_PATH.set(rel.replace("\\", "/"))
+    try:
+        require_no_secret_values(label, text, javascript_dialect=javascript_review_dialect(rel),
+                                 go_source=Path(rel).suffix == '.go', compose_source=compose_review_path(rel),
+                                 python_source=Path(rel).suffix == '.py')
+    finally:
+        _CAPTURED_SOURCE_PATH.reset(source_token)
+        _PYTHON_FIXTURE_PLACEHOLDERS.reset(token)
+
+
 
 
 def require_safe_diff(paths: list[str], patch: str, units: list[str]) -> None:

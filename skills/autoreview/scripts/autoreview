@@ -2826,6 +2826,7 @@ def file_bundle_snapshot(
     repo: Path,
     path: Path,
     rel: str,
+    *, _capture_only: bool = False,
 ) -> tuple[str, str | None]:
     normalized = rel.replace(os.sep, "/")
     path_risk = sensitive_repo_path_risk(normalized)
@@ -2851,8 +2852,10 @@ def file_bundle_snapshot(
         text = data.decode("utf-8")
     except UnicodeDecodeError:
         return "", "non-UTF-8 file"
-    source_guard.require_safe_source("file source", normalized, text)
+    if not _capture_only:
+        source_guard.require_safe_source("file source", normalized, text)
     return text, None
+
 
 
 def linked_worktree_boundary(
@@ -2984,7 +2987,7 @@ def local_status(repo: Path, untracked: list[str], *, redact: bool = False) -> s
     return status
 
 
-def mixed_source_text(path: str, version: str, data: bytes) -> str:
+def mixed_source_text(path: str, version: str, data: bytes, *, _capture_only: bool = False) -> str:
     label = f"mixed source {display_escape(path, 500)} ({version})"
     if b"\0" in data:
         raise SystemExit(f"{label}: binary file")
@@ -2992,8 +2995,10 @@ def mixed_source_text(path: str, version: str, data: bytes) -> str:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
         raise SystemExit(f"{label}: non-UTF-8 file") from None
-    source_guard.require_safe_source("mixed source", path, text)
+    if not _capture_only:
+        source_guard.require_safe_source("mixed source", path, text)
     return text
+
 
 
 def git_source_version(repo: Path, path: str, ref: str | None) -> SourceVersion:
@@ -3016,12 +3021,13 @@ def git_source_version(repo: Path, path: str, ref: str | None) -> SourceVersion:
     return SourceVersion(f"git:{oid}:{mode}", mode, None)
 
 
-def read_git_source(repo: Path, path: str, version: str, source: SourceVersion) -> SourceVersion:
+def read_git_source(repo: Path, path: str, version: str, source: SourceVersion, *, _capture_only: bool = False) -> SourceVersion:
     if source.mode is None:
         return source
     oid = source.identity.split(":")[1]
-    content = mixed_source_text(path, version, git_bytes(repo, "cat-file", "blob", oid).stdout)
+    content = mixed_source_text(path, version, git_bytes(repo, "cat-file", "blob", oid).stdout, _capture_only=_capture_only)
     return source._replace(content=content)
+
 
 
 def mixed_source_topology(repo: Path, path: str) -> tuple[tuple[int, int, int], ...]:
@@ -3129,12 +3135,14 @@ def capture_mixed_paths(
     return tuple(records)
 
 
-def verify_mixed_sources(repo: Path, records: tuple[MixedPath, ...]) -> None:
-    for record in records:
-        if (mixed_source_topology(repo, record.path) != record.topology
-                or git_source_version(repo, record.path, None).identity != record.index.identity
-                or working_source_version(repo, record.path) != record.working_tree):
-            raise SystemExit("mixed source changed; rerun autoreview against the updated inputs")
+def verify_mixed_sources(repo: Path, records: tuple[MixedPath, ...], *, source_inputs=()) -> None:
+    with source_guard.captured_source_context(captured_guard_sources(source_inputs)):
+        for record in records:
+            if (mixed_source_topology(repo, record.path) != record.topology
+                    or git_source_version(repo, record.path, None).identity != record.index.identity
+                    or working_source_version(repo, record.path) != record.working_tree):
+                raise SystemExit("mixed source changed; rerun autoreview against the updated inputs")
+
 
 
 def local_diff_capture(repo: Path, *args: str) -> tuple[str, str, str, list[str]]:
@@ -3541,13 +3549,15 @@ def commit_bundle(repo: Path, commit_ref: str) -> CapturedBundle:
     return CapturedBundle(text, paths, commit=refs[-1])
 
 
-def build_bundle(repo: Path, target: str, target_ref: str | None, commit_ref: str) -> CapturedBundle:
-    if target == "local":
-        return local_bundle(repo, target_ref)
-    if target == "branch":
-        assert target_ref
-        return branch_bundle(repo, target_ref)
-    return commit_bundle(repo, commit_ref)
+def build_bundle(repo: Path, target: str, target_ref: str | None, commit_ref: str, *, source_inputs=()) -> CapturedBundle:
+    with source_guard.captured_source_context(captured_guard_sources(source_inputs)):
+        if target == "local":
+            return local_bundle(repo, target_ref)
+        if target == "branch":
+            assert target_ref
+            return branch_bundle(repo, target_ref)
+        return commit_bundle(repo, commit_ref)
+
 
 
 def relative_evidence_path(repo: Path, raw_path: str, label: str) -> Path:
@@ -3562,7 +3572,7 @@ def relative_evidence_path(repo: Path, raw_path: str, label: str) -> Path:
     return original
 
 
-def validate_evidence_file(repo: Path, raw_path: str, label: str) -> tuple[Path, str]:
+def validate_evidence_file(repo: Path, raw_path: str, label: str, *, _capture_only: bool = False) -> tuple[Path, str]:
     original = relative_evidence_path(repo, raw_path, label)
     raw_rel = original.as_posix()
     if path_has_sensitive_part(raw_rel):
@@ -3573,10 +3583,11 @@ def validate_evidence_file(repo: Path, raw_path: str, label: str) -> tuple[Path,
     if not is_within(path, repo.resolve()):
         raise SystemExit(f"{label} must be inside the reviewed repository: {raw_path}")
     rel = str(path.relative_to(repo.resolve()))
-    content, risk = file_bundle_snapshot(repo, path, rel)
+    content, risk = file_bundle_snapshot(repo, path, rel, _capture_only=_capture_only)
     if risk:
         raise SystemExit(f"refusing to include unsafe {label}: {rel} ({risk})")
     return path, content
+
 
 
 def evidence_topology(repo: Path, raw_path: str) -> tuple[tuple[int, int, int], ...]:
@@ -3596,14 +3607,22 @@ def evidence_topology(repo: Path, raw_path: str) -> tuple[tuple[int, int, int], 
     return tuple(identities)
 
 
-def capture_evidence_file(repo: Path, raw_path: str, label: str) -> EvidenceFile:
+def capture_evidence_file(repo: Path, raw_path: str, label: str, *, _capture_only: bool = False) -> EvidenceFile:
     # Keep evidence's stricter role validation even for tracked source paths.
     raw_path = relative_evidence_path(repo, raw_path, label).as_posix()
     before = evidence_topology(repo, raw_path)
-    path, content = validate_evidence_file(repo, raw_path, label)
+    path, content = validate_evidence_file(repo, raw_path, label, _capture_only=_capture_only)
     if evidence_topology(repo, raw_path) != before:
         raise SystemExit("evidence changed while being captured")
     return EvidenceFile(raw_path, label, path, content, before)
+
+
+
+def captured_guard_sources(records):
+    # Records already bind path topology and exact file/blob contents. Return
+    # only those frozen bytes; the guard never discovers dependencies itself.
+    return tuple((record.raw_path, record.source.content if isinstance(record, SourceContext) else record.content)
+                 for record in records)
 
 
 def capture_evidence_inputs(args: argparse.Namespace, repo: Path) -> EvidenceInputs:
@@ -3615,7 +3634,7 @@ def capture_evidence_inputs(args: argparse.Namespace, repo: Path) -> EvidenceInp
     captured: dict[tuple[str, str], EvidenceFile] = {}
     for label, paths in (("--prompt-file", args.prompt_file), ("--dataset", args.dataset)):
         for raw_path in paths or []:
-            record = capture_evidence_file(repo, raw_path, label)
+            record = capture_evidence_file(repo, raw_path, label, _capture_only=True)
             key = (label, record.raw_path)
             if key in captured:
                 if captured[key] != record:
@@ -3630,10 +3649,14 @@ def capture_evidence_inputs(args: argparse.Namespace, repo: Path) -> EvidenceInp
                 chunks.append(f"# Prompt file: {rel}\n{record.content}")
             else:
                 datasets.append(ReviewDataset(rel, record.content))
+    with source_guard.captured_source_context((row.raw_path, row.content) for row in files):
+        for row in files:
+            source_guard.require_safe_source("file source", row.raw_path, row.content)
     return EvidenceInputs("\n\n".join(chunks), datasets, files)
 
 
-def capture_source_context(repo: Path, raw_path: str, commit: str) -> SourceContext:
+
+def capture_source_context(repo: Path, raw_path: str, commit: str, *, _capture_only: bool = False) -> SourceContext:
     original = relative_evidence_path(repo, raw_path, "--source-context")
     if original.anchor:
         raise SystemExit("--source-context must be a repo-relative path")
@@ -3654,7 +3677,7 @@ def capture_source_context(repo: Path, raw_path: str, commit: str) -> SourceCont
     fingerprint = source_file_fingerprint(path)
     if fingerprint[0] != "file":
         raise SystemExit("--source-context requires a regular checkout path")
-    source = read_git_source(repo, rel, "source context", git_source_version(repo, rel, commit))
+    source = read_git_source(repo, rel, "source context", git_source_version(repo, rel, commit), _capture_only=_capture_only)
     if source.mode is None:
         raise SystemExit(f"--source-context is absent from the reviewed commit: {display_escape(rel, 500)}")
     # Bind the bytes to the tree's blob, including on a damaged object store.
@@ -3672,6 +3695,7 @@ def capture_source_context(repo: Path, raw_path: str, commit: str) -> SourceCont
     return SourceContext(rel, commit, source, topology, fingerprint)
 
 
+
 def capture_source_context_inputs(
     args: argparse.Namespace, repo: Path, captured: CapturedBundle, evidence: EvidenceInputs,
 ) -> EvidenceInputs:
@@ -3685,7 +3709,7 @@ def capture_source_context_inputs(
             raise SystemExit(f"{role} requires a committed branch or commit review; local mode is unsupported")
         for path in paths or []:
             assert captured.commit is not None
-            record = capture_source_context(repo, path, captured.commit)
+            record = capture_source_context(repo, path, captured.commit, _capture_only=True)
             # Validate every alias before sharing this role's frozen source capture.
             key = (role, record.raw_path)
             if key in sources:
@@ -3704,19 +3728,26 @@ def capture_source_context_inputs(
                 chunks.append(render_datasets([dataset]))
             else:
                 datasets.append(dataset)
+    with source_guard.captured_source_context(captured_guard_sources(files)):
+        for row in files:
+            content = row.source.content if isinstance(row, SourceContext) else row.content
+            source_guard.require_safe_source("captured source", row.raw_path, content)
     return EvidenceInputs("\n\n".join(chunks), datasets, files)
 
 
+
 def verify_evidence(repo: Path, files: list[EvidenceFile | SourceContext]) -> None:
-    for record in files:
-        try:
-            current = (capture_source_context(repo, record.raw_path, record.commit)
-                       if isinstance(record, SourceContext)
-                       else capture_evidence_file(repo, record.raw_path, record.label))
-        except SystemExit as exc:
-            raise SystemExit("evidence changed or became unsafe; rerun autoreview") from exc
-        if current != record:
-            raise SystemExit("evidence changed; rerun autoreview against the updated inputs")
+    with source_guard.captured_source_context(captured_guard_sources(files)):
+        for record in files:
+            try:
+                current = (capture_source_context(repo, record.raw_path, record.commit)
+                           if isinstance(record, SourceContext)
+                           else capture_evidence_file(repo, record.raw_path, record.label))
+            except SystemExit as exc:
+                raise SystemExit("evidence changed or became unsafe; rerun autoreview") from exc
+            if current != record:
+                raise SystemExit("evidence changed; rerun autoreview against the updated inputs")
+
 
 
 def render_datasets(datasets: list[ReviewDataset]) -> str:
@@ -7417,7 +7448,7 @@ def dry_run_preflight(
     bundle_ok = True
     try:
         with PreparationProgress("bundle preparation"):
-            captured = build_bundle(repo, target, target_ref, args.commit)
+            captured = build_bundle(repo, target, target_ref, args.commit, source_inputs=evidence.files)
             for reviewer in reviewers:
                 require_image_engine(reviewer.engine, captured.images)
         if target == "commit":
@@ -7442,7 +7473,7 @@ def dry_run_preflight(
                 check_review_plan(args, prompts)
             with PreparationProgress("evidence verification"):
                 verify_evidence(repo, evidence.files)
-                verify_mixed_sources(repo, captured.mixed)
+                verify_mixed_sources(repo, captured.mixed, source_inputs=evidence.files)
             print("prompt: OK", flush=True)
         except SystemExit as exc:
             ok = False
@@ -7487,7 +7518,7 @@ def run_reviewer(
     outgoing = prompt.prompt if isinstance(prompt, ReviewPass) else prompt
     with PreparationProgress("evidence verification"):
         verify_evidence(repo, evidence or [])
-        verify_mixed_sources(repo, mixed)
+        verify_mixed_sources(repo, mixed, source_inputs=evidence or [])
     # Captured inputs passed the lexical guard before partitioning.
     # Recheck their existing owner identities before transmitting them.
     raw = run_engine(args, repo, outgoing)
@@ -7770,7 +7801,7 @@ def main_with_args(args: argparse.Namespace) -> int:
     with PreparationProgress("initial source snapshot") as progress:
         review_source_snapshot = source_tree_snapshot(repo, progress)
     with PreparationProgress("bundle/evidence preparation"):
-        captured = build_bundle(repo, target, target_ref, args.commit)
+        captured = build_bundle(repo, target, target_ref, args.commit, source_inputs=evidence.files)
         require_image_engine(reviewer.engine, captured.images)
         if target == "commit":
             target_ref = args.commit
@@ -7786,7 +7817,7 @@ def main_with_args(args: argparse.Namespace) -> int:
     with PreparationProgress("pre-review verification") as progress:
         current_snapshot = source_tree_snapshot(repo, progress)
         verify_evidence(repo, evidence.files)
-        verify_mixed_sources(repo, captured.mixed)
+        verify_mixed_sources(repo, captured.mixed, source_inputs=evidence.files)
         if current_snapshot != review_source_snapshot:
             raise SystemExit(
                 "source changed while the review bundle was being created; "
@@ -7827,7 +7858,7 @@ def main_with_args(args: argparse.Namespace) -> int:
     with PreparationProgress("final source verification") as progress:
         current_snapshot = source_tree_snapshot(repo, progress)
         verify_evidence(repo, evidence.files)
-        verify_mixed_sources(repo, captured.mixed)
+        verify_mixed_sources(repo, captured.mixed, source_inputs=evidence.files)
         if current_snapshot != review_source_snapshot:
             print(
                 "source changed after the review bundle was created; "
