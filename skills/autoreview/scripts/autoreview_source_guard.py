@@ -8288,13 +8288,16 @@ def python_assignment_reference_prefixes(text: str, prefix, contexts, literal_pr
     return set()
 
 def python_supported_resolver_import(part: ast.AST) -> bool:
+    # Global/nonlocal nodes also expose names, but hold strings, not import aliases.
+    # Gate their AST kind before reading aliases; they cannot establish a resolver.
+    if not isinstance(part, ast.ImportFrom):
+        return False
     return all((
-        isinstance(part, ast.ImportFrom), getattr(part, "module", None) == "core.secrets",
+        part.module == "core.secrets",
         getattr(part, "level", None) == 0,
         any(alias.name == "resolve_secret" and alias.asname is None
             for alias in getattr(part, "names", ())),
     ))
-
 
 def python_resolver_binding_risk(part: ast.AST) -> bool:
     if isinstance(part, ast.Name):

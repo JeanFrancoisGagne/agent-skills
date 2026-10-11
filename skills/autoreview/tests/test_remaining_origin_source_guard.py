@@ -190,5 +190,20 @@ class RemainingOriginGuardTests(unittest.TestCase):
         self.refuse(uri.replace(':?MESSAGE', ':?${NESTED}'), 'contract.md')
 
 
+    def test_resolver_import_walk_accepts_unrelated_global_and_nonlocal_statements(self):
+        prefix = 'from core.secrets import resolve_secret\n'
+        suffix = 'token = resolve_secret("SERVICE_TOKEN")\n'
+        for declarations in (
+            'def count():\n    global counter\n',
+            'def owner():\n    counter = None\n    def count():\n        nonlocal counter\n',
+        ):
+            self.accept(prefix + declarations + suffix, 'entry.py')
+
+    def test_resolver_global_shadow_and_literal_origins_stay_refused(self):
+        source = 'from core.secrets import resolve_secret\ndef count():\n    global resolve_secret\n'
+        self.refuse(source + 'token = resolve_secret("SERVICE_TOKEN")\n', 'entry.py')
+        self.refuse('from core.secrets import resolve_secret\ndef count():\n    global counter\ntoken = ' + repr(opaque()) + '\n', 'entry.py')
+
+
 if __name__ == '__main__':
     unittest.main()
