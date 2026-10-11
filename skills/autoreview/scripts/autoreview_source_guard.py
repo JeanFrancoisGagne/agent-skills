@@ -5665,7 +5665,7 @@ def javascript_selected_argument_context(text, code):
 def javascript_selected_argument_callee(prefix):
     prefix = prefix.rstrip()
     name = re.search(r"[A-Za-z_$][\w$]*$", prefix)
-    if name is not None and name.group() in {"if", "while", "for", "switch", "catch", "with", "typeof", "void", "delete", "function"}:
+    if name is not None and not prefix[:name.start()].rstrip().endswith(".") and name.group() in {"if", "while", "for", "switch", "catch", "with", "typeof", "void", "delete", "function", "return", "throw"}:
         return False
     return re.search(r"(?:[\w$)\]>]|\?\.)$", prefix) is not None
 
@@ -6783,6 +6783,10 @@ def javascript_code_symbol_reference(text, reference, called=False, ancestors=fr
     code = javascript_binding_code(text)
     parts = reference.replace('?.', '.').split('.')
     root, selection = parts[0], parts[1:]
+    # A captured argument spelled undefined can be a function object. Keep its
+    # actual origin instead of treating a shadowed binding as absence.
+    if root == "undefined" and external_argument and not selection and not called and not javascript_unshadowed_undefined(code):
+        return False
     # This role comes from the exact captured callable header, including arrows.
     # Unresolved actual arguments cannot establish an invoked formal identity;
     # they must not borrow the separate direct-runtime-parameter allowance.
@@ -7239,13 +7243,723 @@ def javascript_code_parameter_occurrence(text, start, expression):
 
 
 
-def javascript_scoped_code_expression(text, start, expression):
+def javascript_code_projection_context(path, text, bindings=None):
+    return (path, text, {} if bindings is None else bindings)
+
+
+def javascript_code_projection_decisions(context, values, selection, invocation, seen):
+    return javascript_code_decisions([
+        javascript_code_projection_origin(context, value, selection, invocation, seen)
+        for value in values])
+
+
+def javascript_code_projection_branches(expression):
+    branches = javascript_code_value_branch_origins(expression)
+    return branches if branches != [expression] else None
+
+
+def javascript_code_projection_call_parts(expression):
+    code = javascript_binding_code(expression)
+    target = re.match(URI_CREDENTIAL_REFERENCE_TEXT, code)
+    if target is None:
+        return None
+    part = javascript_code_call_part(code, target.end())
+    if part is None or part[0] != len(code):
+        return None
+    opening = code.find('(', target.end())
+    return target.group().strip(), split_top_level_call_arguments(expression[opening + 1:-1])
+
+
+def javascript_code_projection_computed(expression):
+    match = re.fullmatch(r'(?P<base>[A-Za-z_$][\w$]*(?:(?:\?\.|\.)[A-Za-z_$][\w$]*)*)\s*\[\s*(?P<key>[^\[\]]+)\s*\](?:(?:\?\.|\.)(?P<method>[A-Za-z_$][\w$]*)\(\))?', expression)
+    if match is None:
+        return None
+    if javascript_expression_has_literal(match.group('key')):
+        return None
+    method = match.group('method')
+    return match.group('base'), ('*',) + (() if method is None else (method,)), None if method is None else ()
+
+
+def javascript_code_projection_reference_parts(expression, selection):
+    # Selected-value projection emits '*' for a computed member. Preserve that
+    # internal path so the receiver keeps its captured write and origin checks.
+    pattern = r'[A-Za-z_$][\w$]*(?:(?:\?\.|\.)(?:[A-Za-z_$][\w$]*|\*))*'
+    if re.fullmatch(pattern, expression) is None:
+        return None
+    parts = expression.replace('?.', '.').split('.')
+    return parts[0], tuple(parts[1:]) + selection
+
+
+
+def javascript_code_projection_source(context, name):
+    path, text, bindings = context
+    token = _CAPTURED_SOURCE_PATH.set(path)
+    try:
+        binding = javascript_captured_code_import(text, name)
+    finally:
+        _CAPTURED_SOURCE_PATH.reset(token)
+    if binding is None:
+        return None
+    module, original = binding
+    raw = dict(_CAPTURED_SOURCES.get())[module]
+    declaration = re.search(r'\bfunction\s+' + re.escape(original) + r'(?![\w$])', javascript_binding_code(raw))
+    position = declaration.end() - len(original) if declaration else 0
+    projected, owned = javascript_scoped_reference_graph(raw, position, original)
+    return javascript_code_projection_context(module, projected), owned
+
+
+def javascript_code_projection_callable_rebinding(text, code, name):
+    if javascript_code_unproved_rebinding(text, code, name):
+        return True
+    declarations = re.search(r'\bfunction\s+' + re.escape(name) + r'(?![\w$])', code)
+    return declarations is not None and bool(javascript_binding_initializers(text, code, name))
+
+
+def javascript_code_projection_callable(context, name):
+    path, text, bindings = context
+    code = javascript_binding_code(text)
+    if javascript_code_projection_callable_rebinding(text, code, name):
+        return False
+    imported = javascript_code_projection_source(context, name)
+    if imported is not None:
+        return False if javascript_binding_initializers(text, code, name) else imported
+    owner = javascript_code_captured_argument_owner(name + '(', name + '(', len(name), module=text)
+    return owner if owner is False or owner is None else (context, owner[1])
+
+
+def javascript_code_projection_formals(parameters):
+    parts = javascript_parameter_parts(javascript_binding_code(parameters))
+    if len(parts) > MAX_JAVASCRIPT_INITIALIZER_ROOTS:
+        return None
+    # The splitter retains the empty part after a legal trailing comma. Remove
+    # only that part; leading/interior empties must still fail the name match.
+    if len(parts) > 1 and not parts[-1].strip():
+        parts.pop()
+    names = list(map(re.compile(r'^\s*([A-Za-z_$][\w$]*)\??\s*(?::|=|$)').match, parts))
+    return None if None in names else [match.group(1) for match in names]
+
+
+
+def javascript_code_projection_owned_calls(context, root, calls):
+    code = javascript_binding_code(context[1])
+    _, scopes, declarations = javascript_declaration_context(code)
+    if declarations is None:
+        return None
+    owners = set(map(lambda row: row[0], filter(lambda row: row[1] == root, declarations.values())))
+    if len(owners) > 1:
+        return None
+    owner = next(iter(owners), -1)
+    end = len(code) if owner == -1 else scopes[owner]
+    # Keep nested closures within the declaration lifetime. Caller-side
+    # writes remain with the actual argument's separate source owner.
+    return [(opening, closing) for opening, closing in calls if owner < opening < end]
+
+def javascript_code_projection_write_selection(selection):
+    return list(selection[:selection.index('*')]) if '*' in selection else list(selection)
+
+
+def javascript_code_projection_alias_writes(context, aliases):
+    values = []
+    text = context[1]
+    code = javascript_binding_code(text)
+    for alias, selected in aliases.items():
+        writes = javascript_code_symbol_writes(text, code, alias, javascript_code_projection_write_selection(selected))
+        if writes is None:
+            return None
+        values.extend((context, value) for value in writes)
+    return values
+
+
+def javascript_code_projection_identity_returns(context, parts, aliases, seen, same_owner=True):
+    key = (context[0], context[1], 'returned-carrier', parts)
+    if key in seen or len(seen) >= MAX_JAVASCRIPT_INITIALIZER_ROOTS:
+        # A recursive captured return cannot prove that the selected owner
+        # disappeared. Keep its carrier risk instead of accepting an empty graph.
+        return True
+    seen = seen | {key}
+    aliases = aliases if same_owner else {}
+    returns = javascript_local_return_origins(*parts)
+    return any(map(lambda origin: any(map(
+        lambda value: javascript_code_projection_returned_carrier(context, value, aliases, seen),
+        javascript_code_value_branch_origins(origin) or [origin])), returns))
+
+
+def javascript_code_projection_formal_member(owner, name, selection, seen):
+    owned, parts = owner
+    aliases = javascript_code_selected_alias_paths(owned[1], javascript_binding_code(owned[1]), name, selection)
+    return aliases is None or javascript_code_projection_identity_returns(owned, parts, aliases, seen)
+
+
+def javascript_code_projection_formal_identity(context, owner, arguments, aliases, seen):
+    names = javascript_code_projection_formals(owner[1][0])
+    if names is None:
+        return True
+    for name, argument in zip(names, arguments):
+        if not javascript_code_projection_carrier(context, argument, aliases, seen):
+            continue
+        selection = javascript_code_argument_selection(argument, aliases)
+        # A captured formal retains the actual selected suffix. Unknown wrapped
+        # carriers cannot prove that a return lost that owner or its writes.
+        if selection is None:
+            return True
+        if javascript_code_projection_formal_member(owner, name, selection, seen):
+            return True
+    return False
+
+
+
+def javascript_code_projection_container_carrier(context, value, aliases, seen):
+    # A returned container retains a selected value as a mutable member.
+    # Terminal read depth for a bare return cannot clear that container.
+    if javascript_code_projection_reference_parts(value, ()) is not None:
+        return javascript_code_argument_selection(value, aliases) is not None
+    return javascript_code_projection_returned_carrier(context, value, aliases, seen)
+
+
+
+
+def javascript_code_projection_native_scalar(context, expression, seen):
+    expression = javascript_code_callable_group_origin(expression)
+    if expression is None:
+        return False
+    expression = javascript_grouped_reference_code(expression).strip()
+    key = (context[0], context[1], 'native-scalar:' + expression)
+    if key in seen or len(seen) >= MAX_JAVASCRIPT_INITIALIZER_ROOTS:
+        return False
+    seen = seen | {key}
+    return javascript_code_projection_native_scalar_value(context, expression, seen)
+
+
+def javascript_code_projection_selected_alias_risk(text, code, aliases):
+    # Keep the original short-circuit order for unresolved aliases,
+    # prototype changes and selected writes.
+    return aliases is None or javascript_prototype_writes(text, code, aliases) or any((javascript_code_symbol_writes(text, code, alias, member) != [] for alias, member in aliases.items()))
+
+
+def javascript_code_projection_node_env_source(context, path, source, seen):
+    # This module keeps its ordinary call-effect proof. Captured siblings
+    # must also prove that they add no selected environment effect.
+    source_code = javascript_binding_code(source)
+    if javascript_short_reference_declared(source, source_code, 'process') or javascript_binding_initializers(source, source_code, 'process'):
+        return False
+    aliases = javascript_code_selected_alias_paths(source, source_code, 'process', ['env'])
+    if javascript_code_projection_selected_alias_risk(source, source_code, aliases):
+        return False
+    if path != context[0] and javascript_code_projection_effect_values(javascript_code_projection_context(path, source), 'process', ('env',), seen) != []:
+        return False
+    return True
+
+
+def javascript_code_projection_node_env_global(context, text, bindings, code, seen):
+    # Resolve only the canonical Node global. Its index type cannot prove
+    # inherited values scalar; keep every captured source check.
+    if 'process' in bindings or javascript_short_reference_declared(text, code, 'process') or javascript_binding_initializers(text, code, 'process'):
+        return False
+    sources = ((context[0], text),) + tuple(_CAPTURED_SOURCES.get())
+    for path, source in sources:
+        if not javascript_code_projection_node_env_source(context, path, source, seen):
+            return False
+    return True
+
+
+def javascript_code_projection_node_env_container(context, expression, seen, selection):
+    values = javascript_selected_value_origins(expression, list(selection))
+    return values is not None and bool(values) and all((javascript_code_projection_node_env(context, value, seen) for value in values))
+
+
+def javascript_code_projection_node_env_bound(context, root, seen, selection, text, bindings, code):
+    # One captured initializer owns an alias or an omitted formal default.
+    # Multiple writes, data defaults and unknown actuals cannot borrow it.
+    if root in bindings:
+        actual_context, actual = bindings[root]
+        if actual != 'undefined' or not javascript_unshadowed_undefined(javascript_binding_code(actual_context[1])):
+            return javascript_code_projection_node_env(actual_context, actual, seen, selection)
+    values = javascript_binding_initializers(text, code, root)
+    return len(values) == 1 and javascript_code_projection_node_env(context, values[0], seen, selection)
+
+
+def javascript_code_projection_node_env_reference(context, expression, seen, selection, text, bindings, code):
+    parts = javascript_code_projection_reference_parts(expression, selection)
+    if parts is None:
+        return False
+    root, selection = parts
+    if {'__proto__', 'prototype', 'constructor'} & set(selection) or javascript_code_unproved_rebinding(text, code, root):
+        return False
+    aliases = javascript_code_selected_alias_paths(text, code, root, list(selection))
+    if javascript_code_projection_selected_alias_risk(text, code, aliases):
+        return False
+    return javascript_code_projection_node_env_bound(context, root, seen, selection, text, bindings, code)
+
+
+def javascript_code_projection_node_env_value(context, expression, seen, selection, text, bindings, code):
+    if expression == 'process.env' and (not selection):
+        return javascript_code_projection_node_env_global(context, text, bindings, code, seen)
+    if expression.startswith(('{', '[')) and selection:
+        return javascript_code_projection_node_env_container(context, expression, seen, selection)
+    return javascript_code_projection_node_env_reference(context, expression, seen, selection, text, bindings, code)
+
+
+def javascript_code_projection_native_scalar_branches(context, branches, seen):
+    return bool(branches) and all((javascript_code_projection_native_scalar(context, value, seen) for value in branches))
+
+
+def javascript_code_projection_native_scalar_bound(context, root, code, seen):
+    if root in context[2]:
+        owned, actual = context[2][root]
+        if actual != 'undefined' or not javascript_unshadowed_undefined(javascript_binding_code(owned[1])):
+            return javascript_code_projection_native_scalar(owned, actual, seen)
+    values = javascript_binding_initializers(context[1], code, root)
+    return len(values) == 1 and javascript_code_projection_native_scalar(context, values[0], seen)
+
+
+def javascript_code_projection_native_scalar_reference(context, expression, code, seen):
+    parts = javascript_code_projection_reference_parts(expression, ())
+    if parts is None:
+        return False
+    root, members = parts
+    if not members:
+        return javascript_code_projection_native_scalar_bound(context, root, code, seen)
+    return False
+
+
+def javascript_code_projection_native_scalar_dispatch(context, computed, expression, code, seen):
+    # Only a successful native String.trim call establishes this result.
+    # Raw reads and arbitrary methods keep their existing origin checks.
+    if computed is not None:
+        base, selection, invocation = computed
+        if (selection, invocation) != (('*', 'trim'), ()):
+            return False
+    else:
+        return javascript_code_projection_native_scalar_reference(context, expression, code, seen)
+    sources = (context[1],) + tuple((source for _, source in _CAPTURED_SOURCES.get()))
+    if any((javascript_prototype_writes(source, javascript_binding_code(source)) for source in sources)):
+        return False
+    return javascript_code_projection_node_env(context, base, seen)
+
+
+def javascript_code_projection_native_scalar_value(context, expression, seen):
+    branches = javascript_code_projection_branches(expression)
+    if branches is not None:
+        return javascript_code_projection_native_scalar_branches(context, branches, seen)
+    code = javascript_binding_code(context[1])
+    if expression == 'undefined':
+        return 'undefined' not in context[2] and javascript_unshadowed_undefined(code)
+    computed = javascript_code_projection_computed(expression)
+    return javascript_code_projection_native_scalar_dispatch(context, computed, expression, code, seen)
+
+
+def javascript_code_projection_read_alias_member(values, aliases):
+    # This checks the final read member only. It makes no value-type claim.
+    parts = javascript_code_projection_reference_parts(values[0], ())
+    return parts is not None and bool(parts[1]) and bool(aliases.get(parts[0])) and (javascript_code_argument_selection(values[0], aliases) == [])
+
+
+def javascript_code_projection_expression_alias_carrier(expression, aliases):
+    return any((match.group() in aliases for match in re.finditer('[A-Za-z_$][\\w$]*', javascript_binding_code(expression))))
+
+
+def javascript_code_projection_returned_reference_carrier(context, value, aliases):
+    member = javascript_code_argument_selection(value, aliases)
+    root = javascript_grouped_reference_code(value).strip().split('.')[0]
+    if member == [] and aliases.get(root) == [] and javascript_code_projection_read_alias_terminal(context, root, aliases):
+        return False
+    return member is not None and (bool(member) or aliases.get(root) == [])
+
+
+def javascript_code_projection_returned_computed_carrier(computed, aliases):
+    # A computed read consumes one actual member. A method call does not;
+    # keep a whole-owner alias and any remaining selected receiver.
+    member = javascript_code_argument_selection(computed[0], aliases)
+    if computed[2] is not None:
+        return bool(member)
+    return member is not None and (member == [] or bool(member[1:]))
+
+
+def javascript_code_projection_external_node_env_reference(root, selection):
+    return root == 'process' and selection and (selection[0] == 'env')
+
+
+def javascript_code_projection_external_process_shadow(text, bindings, root):
+    # A captured formal named process cannot borrow the Node global.
+    # An omitted undefined actual does not remove that shadow.
+    code = javascript_binding_code(text)
+    if root in bindings or javascript_short_reference_declared(text, code, root) or javascript_binding_initializers(text, code, root):
+        return False
+    return True
+
+
+def javascript_code_projection_external_process_admission(root, selection, text, bindings):
+    if javascript_code_projection_external_node_env_reference(root, selection):
+        if not javascript_code_projection_external_process_shadow(text, bindings, root):
+            return False
+    return True
+
+
+def javascript_code_projection_external_bare_scalar(root, selection, invocation):
+    return root in {'null', 'undefined', 'true', 'false'} and (not selection) and (invocation is None)
+
+
+def javascript_code_projection_node_env(context, expression, seen, selection=()):
+    expression = javascript_code_callable_group_origin(expression)
+    if expression is None:
+        return False
+    expression = javascript_grouped_reference_code(expression).strip()
+    key = (context[0], context[1], 'node-env:' + expression, selection)
+    if key in seen or len(seen) >= MAX_JAVASCRIPT_INITIALIZER_ROOTS:
+        return False
+    seen = seen | {key}
+    text, bindings = (context[1], context[2])
+    code = javascript_binding_code(text)
+    return javascript_code_projection_node_env_value(context, expression, seen, selection, text, bindings, code)
+
+
+def javascript_code_projection_read_alias_terminal(context, root, aliases):
+    code = javascript_binding_code(context[1])
+    if re.search('\\b(?:const|let|var)\\s+' + re.escape(root) + '(?![\\w$])', code) is None:
+        return False
+    if root in context[2] or javascript_code_unproved_rebinding(context[1], code, root):
+        return False
+    values = javascript_binding_initializers(context[1], code, root)
+    if len(values) != 1:
+        return False
+    return javascript_code_projection_read_alias_member(values, aliases)
+
+
+def javascript_code_projection_scalar_returns(context, owner, arguments, seen):
+    owned, parts = owner
+    names = javascript_code_projection_formals(parts[0])
+    if names is None or len(arguments) > len(names):
+        return False
+    actuals = [(context, value) for value in arguments] + [(context, 'undefined')] * (len(names) - len(arguments))
+    bound = javascript_code_projection_context(owned[0], owned[1], dict(zip(names, actuals)))
+    returns = javascript_local_return_origins(*parts)
+    return bool(returns) and all(javascript_code_projection_native_scalar(bound, value, seen) for value in returns)
+
+
+
+def javascript_code_projection_call_carrier(context, expression, aliases, seen):
+    call = javascript_code_projection_call_parts(expression)
+    if call is None:
+        return javascript_code_projection_expression_alias_carrier(expression, aliases)
+    name, arguments = call
+    owner = javascript_code_projection_effect_owner(context, name, seen)
+    if owner is False:
+        return True
+    if owner is None:
+        return False
+    if javascript_code_projection_scalar_returns(context, owner, arguments, seen):
+        return False
+    if javascript_code_projection_identity_returns(owner[0], owner[1], aliases, seen, owner[0][:2] == context[:2]):
+        return True
+    return javascript_code_projection_formal_identity(context, owner, arguments, aliases, seen)
+
+
+def javascript_code_projection_field_value(field):
+    field = field.strip()
+    if field.startswith('...'):
+        return field[3:]
+    colon = javascript_binding_code(field).find(':')
+    return field if colon < 0 else field[colon + 1:]
+
+
+def javascript_code_projection_structured_carrier(context, expression, aliases, seen, reader=None):
+    reader = javascript_code_projection_carrier if reader is None else reader
+    fields = split_top_level_call_arguments(expression[1:-1])
+    for field in fields:
+        if reader(context, javascript_code_projection_field_value(field), aliases, seen):
+            return True
+    return False
+
+def javascript_code_projection_carrier(context, expression, aliases, seen=frozenset()):
+    expression = expression.strip()
+    key = (context[0], context[1], 'carrier:' + expression)
+    if key in seen or len(seen) >= MAX_JAVASCRIPT_INITIALIZER_ROOTS:
+        return True
+    seen = seen | {key}
+    if re.fullmatch(URI_CREDENTIAL_REFERENCE_TEXT, expression):
+        return javascript_code_argument_selection(expression, aliases) is not None
+    if expression.startswith(('{', '[')):
+        return javascript_code_projection_structured_carrier(context, expression, aliases, seen)
+    return javascript_code_projection_call_carrier(context, expression, aliases, seen)
+
+
+def javascript_code_projection_actual_members(context, arguments, aliases):
+    members = []
+    for index, value in enumerate(arguments):
+        member = javascript_code_argument_selection(value, aliases)
+        if member is not None:
+            members.append((index, member))
+            continue
+        if javascript_code_projection_carrier(context, value, aliases):
+            return False
+    return members
+
+
+def javascript_code_projection_effect_owner(context, name, seen):
+    key = (context[0], context[1], 'effect-owner:' + name)
+    if key in seen or len(seen) >= MAX_JAVASCRIPT_INITIALIZER_ROOTS:
+        return None
+    owner = javascript_code_projection_callable(context, name)
+    if owner is False or owner is None:
+        return owner
+    owned, parts = owner
+    return javascript_code_projection_effect_owner(owned, parts, seen | {key}) if isinstance(parts, str) else owner
+
+
+def javascript_code_projection_callback_members(bound, names, members, seen):
+    values = []
+    for index, member in members:
+        if index >= len(names):
+            return None
+        writes = javascript_code_projection_effect_values(bound, names[index], tuple(member), seen)
+        if writes is None:
+            return None
+        values.extend(writes)
+    return values
+
+
+def javascript_code_projection_callback_writes(context, code, opening, end, aliases, seen):
+    # Declaration headers bind formals; treating them as calls creates false
+    # cycles and hides the actual recursive call's argument bindings.
+    if re.search(r'\bfunction(?:\s+[A-Za-z_$][\w$]*)?$', code[:opening].rstrip()):
+        return []
+    arguments = split_top_level_call_arguments(context[1][opening + 1:end - 1])
+    members = javascript_code_projection_actual_members(context, arguments, aliases)
+    if members is False:
+        return None
+    if not members:
+        return []
+    return javascript_code_projection_callback_owner(context, code, opening, arguments, members, seen)
+
+
+def javascript_code_projection_callback_owner(context, code, opening, arguments, members, seen):
+    target = re.search(r'(?<![\w$.])([A-Za-z_$][\w$]*)$', code[:opening].rstrip())
+    if target is None:
+        return None
+    owner = javascript_code_projection_effect_owner(context, target.group(1), seen)
+    if owner is False or owner is None:
+        return None
+    return javascript_code_projection_callback_bound(context, owner, arguments, members, seen)
+
+
+def javascript_code_projection_callback_bound(context, owner, arguments, members, seen):
+    owned, parts = owner
+    names = javascript_code_projection_formals(parts[0])
+    if names is None:
+        return None
+    if len(arguments) > len(names):
+        return None
+    actuals = [(context, value) for value in arguments] + [(context, 'undefined')] * (len(names) - len(arguments))
+    bindings = dict(zip(names, actuals))
+    bound = javascript_code_projection_context(owned[0], owned[1], bindings)
+    return javascript_code_projection_callback_members(bound, names, members, seen)
+
+
+def javascript_code_projection_all_callback_writes(context, code, calls, aliases, seen):
+    values = []
+    for opening, end in calls:
+        writes = javascript_code_projection_callback_writes(context, code, opening, end, aliases, seen)
+        if writes is None:
+            return None
+        values.extend(writes)
+    return values
+
+
+def javascript_code_projection_effect_values(context, root, selection, seen=frozenset()):
+    key = (context[0], context[1], root, selection)
+    if key in seen:
+        # A repeated owner can carry new actual value bindings. Empty effects
+        # would hide a recursive selected write, so keep the proof unresolved.
+        return None
+    if len(seen) >= MAX_JAVASCRIPT_INITIALIZER_ROOTS:
+        return None
+    text = context[1]
+    code = javascript_binding_code(text)
+    aliases = javascript_code_selected_alias_paths(text, code, root, list(selection))
+    calls = javascript_selected_argument_context(text, code)
+    calls = None if calls is None else javascript_code_projection_owned_calls(context, root, calls[0])
+    if aliases is None or calls is None:
+        return None
+    return javascript_code_projection_merge_effects(context, code, calls, aliases, seen | {key})
+
+
+def javascript_code_projection_merge_effects(context, code, calls, aliases, seen):
+    if javascript_prototype_writes(context[1], code, aliases):
+        return None
+    direct = javascript_code_projection_alias_writes(context, aliases)
+    callbacks = javascript_code_projection_all_callback_writes(context, code, calls, aliases, seen)
+    return None if direct is None or callbacks is None else direct + callbacks
+
+
+def javascript_code_projection_effects(context, root, selection, seen):
+    values = javascript_code_projection_effect_values(context, root, selection)
+    if values is None:
+        return False
+    return javascript_code_decisions([
+        javascript_code_projection_origin(owned, value, (), None, seen)
+        for owned, value in values])
+
+
+def javascript_code_projection_returned_carrier(context, value, aliases, seen):
+    if javascript_code_projection_reference_parts(value, ()) is not None:
+        return javascript_code_projection_returned_reference_carrier(context, value, aliases)
+    if value.startswith(('{', '[')):
+        return javascript_code_projection_structured_carrier(context, value, aliases, seen, javascript_code_projection_container_carrier)
+    computed = javascript_code_projection_computed(value)
+    if computed is not None:
+        return javascript_code_projection_returned_computed_carrier(computed, aliases)
+    return javascript_code_projection_carrier(context, value, aliases, seen)
+
+def javascript_code_projection_call_effects(context, names, seen):
+    return javascript_code_decisions([
+        javascript_code_projection_effects(context, name, (), seen) for name in names])
+
+
+def javascript_code_projection_call_returns(context, parts, arguments, selection, invocation, seen):
+    names = javascript_code_projection_formals(parts[0])
+    if names is None:
+        return None
+    if len(arguments) > len(names):
+        return None
+    actuals = arguments + [(context, 'undefined')] * (len(names) - len(arguments))
+    bindings = dict(zip(names, actuals))
+    bound = javascript_code_projection_context(context[0], context[1], bindings)
+    effects = javascript_code_projection_call_effects(bound, names, seen)
+    returns = javascript_local_return_origins(*parts)
+    return javascript_code_decisions([effects, javascript_code_projection_decisions(bound, returns, selection, invocation, seen)])
+
+
+def javascript_code_projection_call(context, name, arguments, selection, invocation, seen):
+    key = (context[0], context[1], 'call:' + name, selection, invocation is not None)
+    if key in seen or len(seen) >= MAX_JAVASCRIPT_INITIALIZER_ROOTS:
+        return None
+    seen = seen | {key}
+    owner = javascript_code_projection_callable(context, name)
+    if owner is False or owner is None:
+        return owner
+    owned_context, parts = owner
+    if isinstance(parts, str):
+        return javascript_code_projection_call(owned_context, parts, arguments, selection, invocation, seen)
+    return javascript_code_projection_call_returns(owned_context, parts, arguments, selection, invocation, seen)
+
+
+def javascript_code_projection_external(context, root, selection, invocation):
+    path, text, bindings = context
+    if not javascript_code_projection_external_process_admission(root, selection, text, bindings):
+        return False
+    if javascript_code_projection_external_bare_scalar(root, selection, invocation):
+        if root in bindings:
+            return javascript_code_projection_bound_reference(context, root, selection, invocation, frozenset())
+        if not javascript_short_reference_declared(text, javascript_binding_code(text), root):
+            return javascript_code_symbol_expression(text, root)
+    prefix = tuple(javascript_code_projection_write_selection(selection))
+    reference = '.'.join((root,) + prefix)
+    token = _CAPTURED_SOURCE_PATH.set(path)
+    try:
+        return javascript_code_symbol_reference(text, reference, called=invocation is not None, external_argument=True)
+    finally:
+        _CAPTURED_SOURCE_PATH.reset(token)
+
+
+
+def javascript_code_projection_bound_reference(context, root, selection, invocation, seen):
+    actual_context, actual = context[2][root]
+    # An omitted actual contributes no member value. The reference owner still
+    # checks the formal's default and captured writes; shadowed undefined is not
+    # a bare scalar and must retain its actual value-origin proof.
+    if actual == 'undefined' and 'undefined' not in actual_context[2] and javascript_unshadowed_undefined(javascript_binding_code(actual_context[1])):
+        return True
+    return javascript_code_projection_origin(actual_context, actual, selection, invocation, seen)
+
+
+
+def javascript_code_projection_reference_values(context, root, selection, invocation, seen):
+    text = context[1]
+    code = javascript_binding_code(text)
+    if javascript_code_unproved_rebinding(text, code, root):
+        return False
+    values = javascript_binding_initializers(text, code, root, preserve_callable=invocation is not None)
+    effects = javascript_code_projection_effects(context, root, selection, seen)
+    if not values:
+        return javascript_code_decisions([effects, javascript_code_projection_external(context, root, selection, invocation)])
+    return javascript_code_decisions([effects, javascript_code_projection_decisions(context, values, selection, invocation, seen)])
+
+
+def javascript_code_projection_reference(context, root, selection, invocation, seen):
+    if root in context[2]:
+        actual = javascript_code_projection_bound_reference(context, root, selection, invocation, seen)
+        own = javascript_code_projection_reference_values(context, root, selection, invocation, seen)
+        return javascript_code_decisions([actual, own])
+    if invocation is not None and not selection:
+        return javascript_code_projection_call(context, root, list(invocation), (), None, seen)
+    return javascript_code_projection_reference_values(context, root, selection, invocation, seen)
+
+
+def javascript_code_projection_structured(context, expression, selection, invocation, seen):
+    values = javascript_selected_value_origins(expression, list(selection))
+    if values is None:
+        return None
+    return javascript_code_projection_decisions(context, values, (), invocation, seen)
+
+
+def javascript_code_projection_simple(context, expression, selection, invocation, seen):
+    # Scalar leaves carry no mutable receiver. Canonical CODE proof still
+    # owns captured/shadowed bindings instead of scanning unrelated callbacks.
+    if expression in {'null', 'undefined', 'true', 'false'} and not selection and invocation is None:
+        return javascript_code_projection_external(context, expression, (), None)
+    parts = javascript_code_projection_reference_parts(expression, selection)
+    if parts is not None:
+        return javascript_code_projection_reference(context, *parts, invocation, seen)
+    computed = javascript_code_projection_computed(expression)
+    if computed is not None:
+        base, suffix, called = computed
+        return javascript_code_projection_origin(context, base, suffix + selection, called, seen)
+    return None
+
+
+def javascript_code_projection_value(context, expression, selection, invocation, seen):
+    code = javascript_binding_code(expression)
+    if code.startswith(('{', '[')):
+        return javascript_code_projection_structured(context, expression, selection, invocation, seen)
+    if javascript_expression_has_literal(expression):
+        return False
+    call = javascript_code_projection_call_parts(expression)
+    if call is None:
+        return javascript_code_projection_simple(context, expression, selection, invocation, seen)
+    name, arguments = call
+    actuals = [(context, value) for value in arguments]
+    return javascript_code_projection_call(context, name, actuals, selection, invocation, seen)
+
+
+def javascript_code_projection_origin(context, expression, selection=(), invocation=None, seen=frozenset()):
+    expression = javascript_code_callable_group_origin(expression)
+    if expression is None:
+        return None
+    key = (context[0], context[1], expression, selection, invocation is not None)
+    if key in seen or len(seen) >= MAX_JAVASCRIPT_INITIALIZER_ROOTS:
+        return None
+    seen = seen | {key}
+    branches = javascript_code_projection_branches(expression)
+    if branches is not None:
+        return javascript_code_projection_decisions(context, branches, selection, invocation, seen)
+    return javascript_code_projection_value(context, expression, selection, invocation, seen)
+
+
+def javascript_code_projected_call(text, expression):
+    # Only a captured callable can project its actual arguments onto returned
+    # values. Unknown calls retain the old decision; every captured write remains.
+    context = javascript_code_projection_context(_CAPTURED_SOURCE_PATH.get(), text)
+    return javascript_code_projection_origin(context, expression)
+
+
+def javascript_scoped_code_roots(text, expression):
     expression = javascript_length_comparison_text(javascript_origin_selector_text(text, expression))
     code = javascript_grouped_reference_code(expression)
     roots = list(re.finditer(r'(?<![\w$.])(?P<root>[A-Za-z_$][\w$]*(?:(?:\?\.|\.)[A-Za-z_$][\w$]*)*)', javascript_initializer_value_code(code)))
-    if len(roots) > MAX_JAVASCRIPT_INITIALIZER_ROOTS:
-        return None
-    scoped, _ = javascript_scoped_reference_graph(text, start, 'undefined')
+    return expression, code, roots
+
+
+def javascript_scoped_code_projection(text, start, code, roots):
     original, cursor, replacements = javascript_binding_code(text), start, []
     for root in roots:
         if javascript_initializer_object_key(code, root) or root.group() in {'typeof', 'await', 'void', 'null', 'undefined', 'true', 'false'}:
@@ -7260,9 +7974,21 @@ def javascript_scoped_code_expression(text, start, expression):
         cursor = position + len(base)
     for begin, end, selected in reversed(replacements):
         code = code[:begin] + selected + code[end:]
-    result = javascript_code_symbol_expression(scoped, code)
-    return javascript_code_parameter_occurrence(text, start, expression) if result is None else result
+    return code
 
+
+def javascript_scoped_code_expression(text, start, expression):
+    expression, code, roots = javascript_scoped_code_roots(text, expression)
+    if len(roots) > MAX_JAVASCRIPT_INITIALIZER_ROOTS:
+        return None
+    code = javascript_scoped_code_projection(text, start, code, roots)
+    if code is None:
+        return None
+    scoped, _ = javascript_scoped_reference_graph(text, start, 'undefined')
+    result = javascript_code_symbol_expression(scoped, code)
+    if result is False:
+        return javascript_code_projected_call(scoped, code) is True
+    return javascript_code_parameter_occurrence(text, start, expression) if result is None else result
 
 
 
