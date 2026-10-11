@@ -1523,7 +1523,7 @@ def credentialed_uri_risk(
                 compose_source=compose_source,
             )
             and not (
-                compose_source
+                (compose_source or compose_required_uri_reference(credential.value) is not None)
                 and compose_uri_context(text, credential.scheme_start, credential.context)
                 and compose_uri_username_reference(credential.username)
             )
@@ -1790,10 +1790,19 @@ def compose_uri_context(
 def compose_required_uri_reference(value: str) -> re.Match[str] | None:
     # Required-value messages are diagnostics, never password defaults.
     # Nested substitutions, escaping and quoted expressions remain unrecognized.
-    return re.fullmatch(
+    reference = re.fullmatch(
         r"\$\{(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?P<operator>:?\?)"
-        r"[^${}\r\n\"'`\\@]*\}", value,
+        r"(?P<diagnostic>[^${}\r\n\"'`\\@]*)\}", value,
     )
+    return reference if reference is not None and required_uri_diagnostic_safe(reference) else None
+
+
+def required_uri_diagnostic_safe(reference) -> bool:
+    # Diagnostic labels cannot carry opaque credentials just because the
+    # selector requires an environment value rather than defaulting it.
+    return all(word == reference.group("name") or not uri_userinfo_literal_risk(word)
+               for word in reference.group("diagnostic").split())
+
 
 def compose_environment_reference_ranges(text: str) -> tuple[tuple[int, int], ...]:
     ranges: list[tuple[int, int]] = []
@@ -1899,8 +1908,7 @@ def uri_password_is_interpolated(
     compose_source: bool = False,
 ) -> bool:
     if (
-        compose_source
-        and compose_uri_context(text, scheme_start, context)
+        compose_uri_context(text, scheme_start, context)
         and compose_required_uri_reference(password) is not None
     ):
         return True
@@ -8631,9 +8639,9 @@ def secret_text_risk(
     safe_assignment_ranges += typescript_type_reference_ranges(text, javascript_dialect)
     safe_assignment_ranges += typescript_ambient_member_reference_ranges(text)
 
+    safe_assignment_ranges += compose_required_uri_variable_ranges(text, uri_authorities)
+    safe_assignment_ranges += compose_environment_reference_ranges(text)
     if compose_source:
-        safe_assignment_ranges += compose_required_uri_variable_ranges(text, uri_authorities)
-        safe_assignment_ranges += compose_environment_reference_ranges(text)
         safe_assignment_ranges += compose_mount_reference_ranges(text)
     if python_source:
         safe_assignment_ranges += python_control_reference_ranges(text) + python_fixture_prefix_ranges(text)

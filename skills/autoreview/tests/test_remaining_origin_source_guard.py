@@ -173,5 +173,22 @@ class RemainingOriginGuardTests(unittest.TestCase):
         source = 'export declare const ' + 'S' * 8192 + ': Namespace.Object<{progressToken: Namespace.Optional<Namespace.String>;}>;'
         self.refuse(source, 'contract.txt')
 
+
+    def test_required_configuration_references_keep_diagnostics_out_of_values(self):
+        uri = 'SERVICE_DB_URL: postgresql://${DB_USER:-app}:${DB_PASSWORD:?database password is required}@db:5432/app'
+        for path in ('contract.md', 'contract.txt', 'compose.yml'):
+            self.accept(uri, path)
+            self.accept('SERVICE_TOKEN: ${SERVICE_TOKEN:?service token is required}', path)
+
+    def test_required_diagnostics_and_defaults_cannot_hide_opaque_values(self):
+        uri = 'SERVICE_DB_URL: postgresql://${DB_USER:-app}:${DB_PASSWORD:?MESSAGE}@db:5432/app'
+        for message in (opaque(), 'password=' + opaque()):
+            self.refuse(uri.replace('MESSAGE', message), 'contract.md')
+            self.refuse('SERVICE_TOKEN: ${SERVICE_TOKEN:?' + message + '}', 'contract.md')
+        self.refuse(uri.replace(':?MESSAGE', ':-' + opaque()), 'contract.md')
+        self.refuse(uri.replace('${DB_PASSWORD:?MESSAGE}', opaque()), 'contract.md')
+        self.refuse(uri.replace(':?MESSAGE', ':?${NESTED}'), 'contract.md')
+
+
 if __name__ == '__main__':
     unittest.main()
