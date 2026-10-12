@@ -38,9 +38,11 @@ See [GPT-6.1 Sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol),
 [GPT-6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna) model docs
 and [Codex reasoning modes](https://learn.chatgpt.com/docs/models#know-when-to-use-max-or-ultra).
 
-- Default Codex: preserve only authentication settings from user configuration;
-  ignore provider, profile, context, catalogue settings.
-- Named route projection: select explicitly through existing config override:
+Default: ChatGPT subscription; preserve only user authentication settings.
+Live authentication failure → stop attempt fast; retry pass once on operator's
+validated configured named command-auth route, including context + catalogue.
+Explicit provider / non-auth failure / no valid configured route: no auth fallback.
+Profile settings remain ignored. Force configured route before subscription attempt:
 
 ```bash
 "$AUTOREVIEW" --mode local --codex-config 'model_provider="review_api"'

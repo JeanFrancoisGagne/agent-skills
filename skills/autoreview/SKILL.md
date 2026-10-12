@@ -91,7 +91,14 @@ Ultrafast requires model-catalog support, otherwise Codex sends the standard tie
 Read [engine options](references/engines.md) before selecting another model/effort,
 projecting a provider route, or using Claude, Amp, or Pi. Kimi is refused even in
 dry runs because no supported private prompt-input channel exists; never bypass
-that refusal. By default only authentication settings survive from Codex user config.
+that refusal.
+
+- Default Codex auth: ChatGPT subscription; preserve only user auth settings.
+- Live auth failure → stop attempt fast. Retry pass once on operator's configured,
+  validated named command-auth provider; print selected provider. No valid route → fail.
+- Explicit provider / non-auth failure: no automatic auth fallback.
+- Force configured route: `--codex-config 'model_provider="review_api"'`;
+  `review_api` must match operator `CODEX_HOME/config.toml`.
 
 ## Image review
 

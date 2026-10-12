@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Keep Autoreview's Codex subscription route first, stop authentication failures promptly, and retry once on the operator's validated configured command-auth provider.
+
 - Tighten Crabbox instructions and shared review references into terse wording while preserving rules, examples, commands, and anchors.
 
 - Shorten Autoreview and Crabbox's core instructions, move specialized guidance to on-demand references, and make CI/local-first proof with immediately available boxes explicit.

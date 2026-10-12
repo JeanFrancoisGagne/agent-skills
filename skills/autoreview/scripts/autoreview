@@ -1680,9 +1680,10 @@ def run_with_heartbeat(
     stream_display: Callable[[str, str], str | None] | None = None,
     env: dict[str, str] | None = None,
     engine_stage: EngineStage | None = None,
+    stop_on_output: Callable[[str, str], bool] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     deadline = EngineRuntimeDeadline(label, max_runtime_seconds)
-    if stream_output:
+    if stream_output or stop_on_output is not None:
         return run_with_stream(
             args,
             cwd,
@@ -1690,9 +1691,10 @@ def run_with_heartbeat(
             label=label,
             heartbeat_seconds=heartbeat_seconds,
             deadline=deadline,
-            stream_display=stream_display,
+            stream_display=stream_display if stream_output else lambda _name, _line: None,
             env=env,
             engine_stage=engine_stage,
+            stop_on_output=stop_on_output,
         )
     started = time.monotonic()
     with deferred_owned_process_signals():
@@ -1760,6 +1762,7 @@ def run_with_stream(
     stream_display: Callable[[str, str], str | None] | None,
     env: dict[str, str] | None = None,
     engine_stage: EngineStage | None = None,
+    stop_on_output: Callable[[str, str], bool] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     stdout_parts: list[str] = []
     terminal = "collector_failure"
@@ -1798,6 +1801,7 @@ def run_with_stream(
                 stream_display=stream_display,
                 engine_stage=engine_stage,
                 stdout_parts=stdout_parts,
+                stop_on_output=stop_on_output,
             )
             terminal = "engine_timeout" if isinstance(result, TimedOutEngineProcess) else "returned"
             return result
@@ -1858,6 +1862,7 @@ def collect_streamed_process(
     stream_display: Callable[[str, str], str | None] | None,
     stdout_parts: list[str] | None = None,
     engine_stage: EngineStage | None = None,
+    stop_on_output: Callable[[str, str], bool] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     started = time.monotonic()
     events: queue.Queue[tuple[str, str | None]] = queue.Queue()
@@ -1926,6 +1931,13 @@ def collect_streamed_process(
             stdout_parts.append(line)
         else:
             stderr_parts.append(line)
+        if not deadline.terminated and stop_on_output is not None and stop_on_output(name, line):
+            # Use the same bounded process-group cleanup as deadlines/signals.
+            # Return before displaying the triggering authentication diagnostic.
+            terminate_process_group(proc)
+            return subprocess.CompletedProcess(
+                args, 1, "".join(stdout_parts), "".join(stderr_parts),
+            )
         if engine_stage is not None and stream_display is not None:
             try:
                 engine_stage.seen(name + "_delivered_to_display")
@@ -5411,6 +5423,53 @@ def codex_model_access_failure(result: subprocess.CompletedProcess[str], model: 
     return False
 
 
+CODEX_AUTH_FAILURE_MARKERS = (
+    "401 unauthorized", "http 401", "status code 401", "invalid api key",
+    "missing bearer", "authentication failed", "refresh_token_reused",
+    "token_expired", "refresh token",
+)
+
+
+def codex_authentication_failure(result: subprocess.CompletedProcess[str]) -> bool:
+    # Assistant/tool output can quote auth errors from the reviewed diff.
+    return not isinstance(result, TimedOutEngineProcess) and any(
+        marker in message.lower()
+        for message in codex_error_messages(result)
+        for marker in CODEX_AUTH_FAILURE_MARKERS
+    )
+
+
+def codex_stop_on_auth_failure(name: str, line: str) -> bool:
+    return codex_authentication_failure(subprocess.CompletedProcess(
+        [], 1, line if name == "stdout" else "", line if name == "stderr" else "",
+    ))
+
+
+def load_codex_auth_fallback_route(
+    repo: Path, overrides: Sequence[str], result: subprocess.CompletedProcess[str],
+    *, command_auth: bool,
+) -> tuple[str, tuple[list[str], bytes | None]] | None:
+    if (command_auth or result.returncode == 0
+            or any(item.partition("=")[0].strip() == "model_provider" for item in overrides)
+            or not codex_authentication_failure(result)):
+        return None
+    source_home = codex_source_home(repo)
+    if source_home is None:
+        return None
+    config_path = source_home / "config.toml"
+    if not external_env_path(repo, str(config_path)):
+        return None
+    provider = load_codex_auth_config(config_path).get("model_provider")
+    if not isinstance(provider, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", provider):
+        return None
+    try:
+        route = load_codex_inference_route(repo, [*overrides, f"model_provider={provider}"])
+    except SystemExit:
+        # Invalid/unavailable routes cannot replace the original auth failure.
+        return None
+    return provider, route
+
+
 def codex_failure_category(result: subprocess.CompletedProcess[str]) -> str:
     # Classify only; captured auth-helper diagnostics must never escape.
     text = (result.stderr + "\n" + result.stdout).lower()
@@ -5420,7 +5479,7 @@ def codex_failure_category(result: subprocess.CompletedProcess[str]) -> str:
         ("model-sandbox-policy", ("requires a sandbox", "reviewed escalations")),
         ("cli-arguments", ("unexpected argument", "unrecognized option", "unrecognized subcommand")),
         ("configuration", ("error loading config", "error parsing config", "failed to load config", "invalid configuration", "missing field", "unknown field")),
-        ("authentication", ("401 unauthorized", "http 401", "status code 401", "invalid api key", "missing bearer", "authentication failed")),
+        ("authentication", CODEX_AUTH_FAILURE_MARKERS),
         ("provider-access", ("403 forbidden", "http 403", "do not have access", "not supported when using codex")),
         ("rate-limit", ("429 too many requests", "http 429", "rate limit", "rate_limit")),
         ("transport", ("connection refused", "connection reset", "failed to connect", "stream disconnected", "certificate verify", "timed out")),
@@ -5543,12 +5602,15 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
             )
             runtime_root = Path(runtime_dir)
             runtime_codex_home = runtime_root / "codex-home"
-            route = load_codex_inference_route(repo, codex_config_overrides(args))
+            overrides = codex_config_overrides(args)
+            route = load_codex_inference_route(repo, overrides)
             auth_config = prepare_codex_inference_config(route, runtime_root)
             command_auth = any(flag.startswith("model_provider=") for flag in auth_config)
             auth_config = stage_codex_auth_helper(repo, runtime_root, auth_config)
             file_auth_linked = prepare_codex_runtime_auth(repo, runtime_codex_home)
-            for index, model in enumerate(models):
+            attempts = list(enumerate(models))
+            while attempts:
+                index, model = attempts.pop(0)
                 output_path.write_text("")
                 cmd = codex_command(
                     args,
@@ -5583,6 +5645,7 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                         stream_output=args.stream_engine_output,
                         stream_display=CodexStreamDisplay(suppress_diagnostics=command_auth, engine_stage=engine_stage) if args.stream_engine_output else None,
                         engine_stage=engine_stage,
+                        stop_on_output=codex_stop_on_auth_failure,
                         env=codex_runtime_env(
                             repo,
                             runtime_root,
@@ -5606,6 +5669,28 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                         raise ReviewerUnavailable("codex engine failed: missing-report; provider diagnostics suppressed",
                                                   reason="invalid_report", result=result)
                     return output or result.stdout
+                auth_fallback = load_codex_auth_fallback_route(
+                    repo, overrides, result, command_auth=command_auth,
+                )
+                if auth_fallback is not None:
+                    provider, route = auth_fallback
+                    auth_config = stage_codex_auth_helper(
+                        repo, runtime_root, prepare_codex_inference_config(route, runtime_root),
+                    )
+                    command_auth = True
+                    primary_failure = None
+                    print(
+                        "codex auth: subscription route failed (authentication); "
+                        f"retrying on configured provider {provider}",
+                        file=sys.stderr, flush=True,
+                    )
+                    attempts.insert(0, (index, model))
+                    continue
+                if codex_authentication_failure(result):
+                    raise ReviewerUnavailable(
+                        "codex engine failed: authentication; authentication diagnostics suppressed",
+                        result=result,
+                    )
                 if (
                     index == 0
                     and len(models) > 1

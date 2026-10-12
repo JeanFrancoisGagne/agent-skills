@@ -16,6 +16,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -2215,6 +2216,177 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(SystemExit, "result was not structured JSON"):
             AUTOREVIEW.extract_json(json.dumps(payload))
+
+class AutoreviewAuthFallbackTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="autoreview-auth-fallback.")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        self.home = self.root / "operator"
+        self.home.mkdir()
+        self.env = mock.patch.dict(os.environ, {
+            "HOME": str(self.root), "CODEX_HOME": str(self.home),
+            "AUTOREVIEW_CODEX_CONFIG": "",
+        })
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        self.failure = subprocess.CompletedProcess([], 1, "", "401 Unauthorized")
+
+    def configure_provider(self, *, base_url: str = "https://api.openai.com/v1") -> None:
+        (self.home / "config.toml").write_text(
+            'model_provider = "review_api"\n'
+            '[model_providers.review_api]\n'
+            f'base_url = {json.dumps(base_url)}\n'
+            '[model_providers.review_api.auth]\n'
+            f'command = {json.dumps(sys.executable)}\n',
+        )
+
+    def test_authentication_markers_and_error_event_shapes(self) -> None:
+        for marker in AUTOREVIEW.CODEX_AUTH_FAILURE_MARKERS:
+            for event in (
+                {"type": "error", "message": marker.upper()},
+                {"type": "turn.failed", "error": {"message": marker}},
+            ):
+                with self.subTest(marker=marker, event=event):
+                    self.assertTrue(AUTOREVIEW.codex_stop_on_auth_failure("stderr", marker))
+                    self.assertTrue(AUTOREVIEW.codex_stop_on_auth_failure("stdout", json.dumps(event)))
+                    self.assertEqual(AUTOREVIEW.codex_failure_category(
+                        subprocess.CompletedProcess([], 1, "", marker),
+                    ), "authentication")
+
+    def test_authentication_detection_ignores_review_content(self) -> None:
+        for line in (
+            "401 Unauthorized",
+            json.dumps({"type": "item.completed", "item": {
+                "type": "agent_message", "text": "refresh_token_reused",
+            }}),
+            json.dumps({"type": "item.completed", "item": {
+                "type": "command_execution", "aggregated_output": "token_expired",
+            }}),
+        ):
+            self.assertFalse(AUTOREVIEW.codex_stop_on_auth_failure("stdout", line))
+        self.assertFalse(AUTOREVIEW.codex_stop_on_auth_failure("stderr", "Refreshing token"))
+
+    def test_authentication_stops_live_child_without_enabling_display(self) -> None:
+        for stream in ("stdout", "stderr"):
+            with self.subTest(stream=stream):
+                line = (json.dumps({"type": "error", "message": "token_expired"})
+                        if stream == "stdout" else "refresh_token_reused")
+                script = ("import sys,time; print(" + repr(line)
+                          + f", file=sys.{stream}, flush=True); time.sleep(30)")
+                started = time.monotonic()
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    result = AUTOREVIEW.run_with_heartbeat(
+                        [sys.executable, "-c", script], self.repo,
+                        label="codex", heartbeat_seconds=30,
+                        stop_on_output=AUTOREVIEW.codex_stop_on_auth_failure,
+                    )
+                self.assertLess(time.monotonic() - started, 5)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertTrue(AUTOREVIEW.codex_authentication_failure(result))
+                self.assertEqual(stdout.getvalue() + stderr.getvalue(), "")
+                self.assertFalse(AUTOREVIEW._OWNED_PROCESSES)
+
+    def test_fallback_selects_only_validated_operator_route(self) -> None:
+        self.configure_provider()
+        provider, route = AUTOREVIEW.load_codex_auth_fallback_route(
+            self.repo, [], self.failure, command_auth=False,
+        )
+        self.assertEqual(provider, "review_api")
+        self.assertEqual(route, AUTOREVIEW.load_codex_inference_route(
+            self.repo, ["model_provider=review_api"],
+        ))
+
+    def test_fallback_rejects_explicit_provider_command_auth_and_non_auth_failure(self) -> None:
+        self.configure_provider()
+        for overrides, command_auth, result in (
+            (['model_provider = "review_api"'], False, self.failure),
+            ([], True, self.failure),
+            ([], False, subprocess.CompletedProcess([], 1, "", "connection reset")),
+            ([], False, subprocess.CompletedProcess([], 0, "", "401 Unauthorized")),
+            ([], False, AUTOREVIEW.TimedOutEngineProcess([], 124, "", "401 Unauthorized")),
+        ):
+            with self.subTest(overrides=overrides, command_auth=command_auth, result=result):
+                with mock.patch.object(AUTOREVIEW, "load_codex_inference_route") as load:
+                    self.assertIsNone(AUTOREVIEW.load_codex_auth_fallback_route(
+                        self.repo, overrides, result, command_auth=command_auth,
+                    ))
+                    load.assert_not_called()
+
+    def test_fallback_rejects_absent_invalid_and_split_routes(self) -> None:
+        config = self.home / "config.toml"
+        for contents in (None, "", 'model_provider = "openai"', "invalid TOML ["):
+            with self.subTest(contents=contents):
+                if contents is not None:
+                    config.write_text(contents)
+                self.assertIsNone(AUTOREVIEW.load_codex_auth_fallback_route(
+                    self.repo, [], self.failure, command_auth=False,
+                ))
+        self.configure_provider(base_url="https://example.invalid/v1")
+        self.assertIsNone(AUTOREVIEW.load_codex_auth_fallback_route(
+            self.repo, [], self.failure, command_auth=False,
+        ))
+        self.configure_provider()
+        self.assertIsNone(AUTOREVIEW.load_codex_auth_fallback_route(
+            self.repo, ["model_context_window=1000"], self.failure, command_auth=False,
+        ))
+
+    def run_codex_attempts(self, failures: list[str], *, explicit: bool = False):
+        self.configure_provider()
+        with mock.patch.object(sys, "argv", ["autoreview", "--no-web-search"]):
+            args = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
+        args.model = "review-model"
+        args.fallback_model = None
+        args.codex_config = ['model_provider="review_api"'] if explicit else []
+        commands = []
+
+        def run(command, _cwd, **kwargs):
+            commands.append(command)
+            self.assertEqual(kwargs["input_text"], "same review input")
+            self.assertIs(kwargs["stop_on_output"], AUTOREVIEW.codex_stop_on_auth_failure)
+            if len(commands) <= len(failures):
+                return subprocess.CompletedProcess(command, 1, "", failures[len(commands) - 1])
+            Path(command[command.index("--output-last-message") + 1]).write_text("clean")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        stderr = io.StringIO()
+        with mock.patch.object(AUTOREVIEW, "resolve_command", return_value=sys.executable), \
+                mock.patch.object(AUTOREVIEW, "ensure_codex_isolation_supported"), \
+                mock.patch.object(AUTOREVIEW, "run_with_heartbeat", side_effect=run), \
+                contextlib.redirect_stderr(stderr):
+            try:
+                output = AUTOREVIEW.run_codex(args, self.repo, "same review input")
+            except AUTOREVIEW.ReviewerUnavailable as exc:
+                output = str(exc)
+        return commands, stderr.getvalue(), output
+
+    def test_fallback_retries_same_pass_once_and_prints_one_line(self) -> None:
+        commands, notice, output = self.run_codex_attempts(["401 Unauthorized PRIVATE_SENTINEL"])
+        self.assertEqual(output, "clean")
+        self.assertEqual(len(commands), 2)
+        self.assertNotIn('model_provider="review_api"', commands[0])
+        self.assertIn('model_provider="review_api"', commands[1])
+        self.assertEqual(notice, "codex auth: subscription route failed (authentication); "
+                         "retrying on configured provider review_api\n")
+
+    def test_fallback_failure_is_redacted_and_does_not_retry_again(self) -> None:
+        commands, notice, output = self.run_codex_attempts([
+            "token_expired PRIVATE_SENTINEL", "refresh_token_reused PRIVATE_SENTINEL",
+        ])
+        self.assertEqual(len(commands), 2)
+        self.assertEqual(notice.count("codex auth:"), 1)
+        self.assertIn("authentication", output)
+        self.assertNotIn("PRIVATE_SENTINEL", notice + output)
+
+    def test_explicit_route_authentication_failure_has_no_fallback_notice(self) -> None:
+        commands, notice, output = self.run_codex_attempts(["401 Unauthorized"], explicit=True)
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(notice, "")
+        self.assertIn("authentication", output)
+
 
 if __name__ == "__main__":
     unittest.main()
