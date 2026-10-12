@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Skip Autoreview's first Codex subscription attempt when a local login-status probe confirms no login and a validated configured provider is available; keep subscription-first behavior on probe errors or timeouts.
+
 - Keep Autoreview's Codex subscription route first, allow 401 recovery before stopping repeated or definite authentication failures, and retry once on the operator's validated configured command-auth provider.
 
 - Tighten Crabbox instructions and shared review references into terse wording while preserving rules, examples, commands, and anchors.

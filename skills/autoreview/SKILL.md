@@ -94,6 +94,7 @@ dry runs because no supported private prompt-input channel exists; never bypass
 that refusal.
 
 - Default Codex auth: ChatGPT subscription; preserve only user auth settings.
+- Valid configured provider + `codex login status` reports no login (~10s timeout): skip subscription; probe error/timeout → subscription first; explicit provider → no probe.
 - Live auth failure → stop attempt fast. Retry pass once on operator's configured,
   validated named command-auth provider; print selected provider. No valid route → fail.
 - Live stop: definite credential failure immediately; generic auth failure ≥3 lines / 60s.

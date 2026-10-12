@@ -2396,8 +2396,48 @@ class AutoreviewAuthFallbackTests(unittest.TestCase):
             self.repo, ["model_context_window=1000"], self.failure, command_auth=False,
         ))
 
-    def run_codex_attempts(self, failures: list[str], *, explicit: bool = False):
-        self.configure_provider()
+    def test_login_probe_uses_operator_environment_and_captures_output(self) -> None:
+        for returncode, stdout, stderr, expected in (
+            (1, "", "Not logged in\n", True),
+            (0, "Not logged in\n", "", True),
+            (1, "", "", True),
+            (0, "", "Logged in using ChatGPT\n", False),
+            (1, "", "Error loading configuration PRIVATE_SENTINEL", False),
+            (2, "", "", False),
+        ):
+            with self.subTest(returncode=returncode, stdout=stdout, stderr=stderr), \
+                    mock.patch.object(AUTOREVIEW.subprocess, "run", return_value=subprocess.CompletedProcess(
+                        [], returncode, stdout, stderr,
+                    )) as probe, contextlib.redirect_stdout(io.StringIO()) as out, \
+                    contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(AUTOREVIEW.codex_subscription_login_missing("/codex", self.root), expected)
+                self.assertEqual(out.getvalue() + err.getvalue(), "")
+                self.assertEqual(probe.call_args.args, (["/codex", "login", "status"],))
+                kwargs = probe.call_args.kwargs
+                self.assertEqual(kwargs["cwd"], self.root)
+                self.assertEqual(kwargs["env"], dict(os.environ))
+                self.assertEqual(kwargs["timeout"], 10)
+                self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+                self.assertEqual(kwargs["stdout"], subprocess.PIPE)
+                self.assertEqual(kwargs["stderr"], subprocess.PIPE)
+
+    def test_login_probe_errors_and_timeout_are_unknown(self) -> None:
+        for error in (OSError("PRIVATE_SENTINEL"), subprocess.TimeoutExpired(
+            ["/codex", "login", "status"], 10, output="Not logged in PRIVATE_SENTINEL",
+        )):
+            with self.subTest(error=type(error).__name__), \
+                    mock.patch.object(AUTOREVIEW.subprocess, "run", side_effect=error), \
+                    contextlib.redirect_stdout(io.StringIO()) as out, \
+                    contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertFalse(AUTOREVIEW.codex_subscription_login_missing("/codex", self.root))
+                self.assertEqual(out.getvalue() + err.getvalue(), "")
+
+    def run_codex_attempts(
+        self, failures: list[str], *, explicit: bool = False,
+        login_missing: bool = False, configured: bool = True,
+    ):
+        if configured:
+            self.configure_provider()
         with mock.patch.object(sys, "argv", ["autoreview", "--no-web-search"]):
             args = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
         args.model = "review-model"
@@ -2421,13 +2461,36 @@ class AutoreviewAuthFallbackTests(unittest.TestCase):
         stderr = io.StringIO()
         with mock.patch.object(AUTOREVIEW, "resolve_command", return_value=sys.executable), \
                 mock.patch.object(AUTOREVIEW, "ensure_codex_isolation_supported"), \
+                mock.patch.object(AUTOREVIEW, "codex_subscription_login_missing", return_value=login_missing) as probe, \
                 mock.patch.object(AUTOREVIEW, "run_with_heartbeat", side_effect=run), \
                 contextlib.redirect_stderr(stderr):
             try:
                 output = AUTOREVIEW.run_codex(args, self.repo, "same review input")
             except AUTOREVIEW.ReviewerUnavailable as exc:
                 output = str(exc)
+            self.assertEqual(probe.call_count, int(configured and not explicit))
         return commands, stderr.getvalue(), output
+
+    def test_missing_login_starts_on_configured_route_without_subscription_attempt(self) -> None:
+        commands, notice, output = self.run_codex_attempts([], login_missing=True)
+        self.assertEqual(output, "clean")
+        self.assertEqual(len(commands), 1)
+        self.assertIn('model_provider="review_api"', commands[0])
+        self.assertEqual(notice, "codex auth: no subscription login; using configured provider review_api\n")
+
+    def test_logged_in_or_unknown_login_keeps_subscription_first(self) -> None:
+        commands, notice, output = self.run_codex_attempts([])
+        self.assertEqual(output, "clean")
+        self.assertEqual(len(commands), 1)
+        self.assertNotIn('model_provider="review_api"', commands[0])
+        self.assertEqual(notice, "")
+
+    def test_no_configured_provider_skips_login_probe(self) -> None:
+        commands, notice, output = self.run_codex_attempts([], configured=False)
+        self.assertEqual(output, "clean")
+        self.assertEqual(len(commands), 1)
+        self.assertNotIn('model_provider="review_api"', commands[0])
+        self.assertEqual(notice, "")
 
     def test_fallback_retries_same_pass_once_and_prints_one_line(self) -> None:
         commands, notice, output = self.run_codex_attempts(["401 Unauthorized PRIVATE_SENTINEL"])

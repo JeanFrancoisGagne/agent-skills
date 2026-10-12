@@ -5462,12 +5462,12 @@ class CodexAuthFailureStopper:
 
 
 def load_codex_auth_fallback_route(
-    repo: Path, overrides: Sequence[str], result: subprocess.CompletedProcess[str],
+    repo: Path, overrides: Sequence[str], result: subprocess.CompletedProcess[str] | None = None,
     *, command_auth: bool,
 ) -> tuple[str, tuple[list[str], bytes | None]] | None:
-    if (command_auth or result.returncode == 0
+    if (command_auth
             or any(item.partition("=")[0].strip() == "model_provider" for item in overrides)
-            or not codex_authentication_failure(result)):
+            or (result is not None and (result.returncode == 0 or not codex_authentication_failure(result)))):
         return None
     source_home = codex_source_home(repo)
     if source_home is None:
@@ -5484,6 +5484,21 @@ def load_codex_auth_fallback_route(
         # Invalid/unavailable routes cannot replace the original auth failure.
         return None
     return provider, route
+
+
+def codex_subscription_login_missing(codex_bin: str, cwd: Path) -> bool:
+    try:
+        result = subprocess.run(
+            [codex_bin, "login", "status"], cwd=cwd, env=os.environ.copy(),
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding=SUBPROCESS_TEXT_ENCODING, errors=SUBPROCESS_TEXT_ERRORS,
+            timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    output = (result.stdout + "\n" + result.stderr).strip().lower()
+    # Exit 1 is the logged-out status; nonempty errors remain unknown.
+    return "not logged in" in output or (result.returncode == 1 and not output)
 
 
 def codex_failure_category(result: subprocess.CompletedProcess[str]) -> str:
@@ -5620,8 +5635,18 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
             runtime_codex_home = runtime_root / "codex-home"
             overrides = codex_config_overrides(args)
             route = load_codex_inference_route(repo, overrides)
+            command_auth = any(flag.startswith("model_provider=") for flag in route[0])
+            auth_fallback = load_codex_auth_fallback_route(repo, overrides, command_auth=command_auth)
+            if auth_fallback is not None and codex_subscription_login_missing(
+                resolve_command(args.codex_bin, repo), temp_root,
+            ):
+                provider, route = auth_fallback
+                command_auth = True
+                print(
+                    f"codex auth: no subscription login; using configured provider {provider}",
+                    file=sys.stderr, flush=True,
+                )
             auth_config = prepare_codex_inference_config(route, runtime_root)
-            command_auth = any(flag.startswith("model_provider=") for flag in auth_config)
             auth_config = stage_codex_auth_helper(repo, runtime_root, auth_config)
             file_auth_linked = prepare_codex_runtime_auth(repo, runtime_codex_home)
             attempts = list(enumerate(models))
