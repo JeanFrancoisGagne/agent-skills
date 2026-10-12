@@ -2250,13 +2250,15 @@ class AutoreviewAuthFallbackTests(unittest.TestCase):
                 {"type": "turn.failed", "error": {"message": marker}},
             ):
                 with self.subTest(marker=marker, event=event):
-                    self.assertTrue(AUTOREVIEW.codex_stop_on_auth_failure("stderr", marker))
-                    self.assertTrue(AUTOREVIEW.codex_stop_on_auth_failure("stdout", json.dumps(event)))
+                    self.assertTrue(AUTOREVIEW.codex_authentication_failure(
+                        subprocess.CompletedProcess([], 1, json.dumps(event), ""),
+                    ))
                     self.assertEqual(AUTOREVIEW.codex_failure_category(
                         subprocess.CompletedProcess([], 1, "", marker),
                     ), "authentication")
 
     def test_authentication_detection_ignores_review_content(self) -> None:
+        stop = AUTOREVIEW.CodexAuthFailureStopper()
         for line in (
             "401 Unauthorized",
             json.dumps({"type": "item.completed", "item": {
@@ -2266,8 +2268,68 @@ class AutoreviewAuthFallbackTests(unittest.TestCase):
                 "type": "command_execution", "aggregated_output": "token_expired",
             }}),
         ):
-            self.assertFalse(AUTOREVIEW.codex_stop_on_auth_failure("stdout", line))
-        self.assertFalse(AUTOREVIEW.codex_stop_on_auth_failure("stderr", "Refreshing token"))
+            self.assertFalse(stop("stdout", line))
+        for line in ("Refreshing token", "Reloading refresh token from disk"):
+            self.assertFalse(stop("stderr", line))
+            self.assertFalse(AUTOREVIEW.codex_authentication_failure(
+                subprocess.CompletedProcess([], 1, "", line),
+            ))
+
+    def test_definite_authentication_failures_stop_immediately(self) -> None:
+        for marker in AUTOREVIEW.CODEX_AUTH_TERMINAL_MARKERS:
+            for stream in ("stdout", "stderr"):
+                with self.subTest(marker=marker, stream=stream):
+                    line = marker.upper()
+                    if stream == "stdout":
+                        line = json.dumps({"type": "error", "message": line})
+                    self.assertTrue(AUTOREVIEW.CodexAuthFailureStopper()(stream, line))
+
+    def test_generic_authentication_failures_allow_two_lines_before_stopping(self) -> None:
+        for marker in AUTOREVIEW.CODEX_AUTH_RECOVERY_MARKERS:
+            with self.subTest(marker=marker), mock.patch.object(AUTOREVIEW.time, "monotonic", return_value=1):
+                stop = AUTOREVIEW.CodexAuthFailureStopper()
+                # Multiple markers in one line still count as one failure line.
+                self.assertFalse(stop("stderr", marker + ": HTTP 401"))
+                self.assertFalse(stop("stdout", json.dumps({"type": "error", "message": marker})))
+                self.assertTrue(stop("stderr", marker))
+
+    def test_generic_authentication_failure_window_expires(self) -> None:
+        for times, expected in (
+            ([0, 30, 60], [False, False, True]),
+            ([0, 30, 60.001, 61], [False, False, False, True]),
+        ):
+            with self.subTest(times=times), mock.patch.object(AUTOREVIEW.time, "monotonic", side_effect=times):
+                stop = AUTOREVIEW.CodexAuthFailureStopper()
+                self.assertEqual([stop("stderr", "401 Unauthorized") for _ in times], expected)
+
+    def test_single_401_and_benign_refresh_log_do_not_stop_child(self) -> None:
+        script = (
+            "import sys,time; print('HTTP 401', file=sys.stderr, flush=True); "
+            "print('Reloading refresh token from disk', file=sys.stderr, flush=True); "
+            "time.sleep(0.05); print('recovered', flush=True)"
+        )
+        result = AUTOREVIEW.run_with_heartbeat(
+            [sys.executable, "-c", script], self.repo, label="codex",
+            stop_on_output=AUTOREVIEW.CodexAuthFailureStopper(),
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("recovered", result.stdout)
+
+    def test_three_401_lines_stop_live_child(self) -> None:
+        script = (
+            "import sys,time; "
+            "print('401 Unauthorized\\nHTTP 401\\nstatus code 401', file=sys.stderr, flush=True); "
+            "time.sleep(30)"
+        )
+        started = time.monotonic()
+        result = AUTOREVIEW.run_with_heartbeat(
+            [sys.executable, "-c", script], self.repo, label="codex",
+            stop_on_output=AUTOREVIEW.CodexAuthFailureStopper(),
+        )
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(AUTOREVIEW.codex_authentication_failure(result))
+        self.assertFalse(AUTOREVIEW._OWNED_PROCESSES)
 
     def test_authentication_stops_live_child_without_enabling_display(self) -> None:
         for stream in ("stdout", "stderr"):
@@ -2282,7 +2344,7 @@ class AutoreviewAuthFallbackTests(unittest.TestCase):
                     result = AUTOREVIEW.run_with_heartbeat(
                         [sys.executable, "-c", script], self.repo,
                         label="codex", heartbeat_seconds=30,
-                        stop_on_output=AUTOREVIEW.codex_stop_on_auth_failure,
+                        stop_on_output=AUTOREVIEW.CodexAuthFailureStopper(),
                     )
                 self.assertLess(time.monotonic() - started, 5)
                 self.assertNotEqual(result.returncode, 0)
@@ -2342,11 +2404,15 @@ class AutoreviewAuthFallbackTests(unittest.TestCase):
         args.fallback_model = None
         args.codex_config = ['model_provider="review_api"'] if explicit else []
         commands = []
+        stoppers = []
 
         def run(command, _cwd, **kwargs):
             commands.append(command)
             self.assertEqual(kwargs["input_text"], "same review input")
-            self.assertIs(kwargs["stop_on_output"], AUTOREVIEW.codex_stop_on_auth_failure)
+            stopper = kwargs["stop_on_output"]
+            self.assertIsInstance(stopper, AUTOREVIEW.CodexAuthFailureStopper)
+            self.assertNotIn(stopper, stoppers)
+            stoppers.append(stopper)
             if len(commands) <= len(failures):
                 return subprocess.CompletedProcess(command, 1, "", failures[len(commands) - 1])
             Path(command[command.index("--output-last-message") + 1]).write_text("clean")

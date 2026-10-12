@@ -5423,11 +5423,14 @@ def codex_model_access_failure(result: subprocess.CompletedProcess[str], model: 
     return False
 
 
-CODEX_AUTH_FAILURE_MARKERS = (
-    "401 unauthorized", "http 401", "status code 401", "invalid api key",
-    "missing bearer", "authentication failed", "refresh_token_reused",
-    "token_expired", "refresh token",
+CODEX_AUTH_RECOVERY_MARKERS = (
+    "401 unauthorized", "http 401", "status code 401", "authentication failed",
 )
+CODEX_AUTH_TERMINAL_MARKERS = (
+    "refresh_token_reused", "refresh token has already been used", "token_expired",
+    "missing bearer", "invalid api key",
+)
+CODEX_AUTH_FAILURE_MARKERS = CODEX_AUTH_RECOVERY_MARKERS + CODEX_AUTH_TERMINAL_MARKERS
 
 
 def codex_authentication_failure(result: subprocess.CompletedProcess[str]) -> bool:
@@ -5439,10 +5442,23 @@ def codex_authentication_failure(result: subprocess.CompletedProcess[str]) -> bo
     )
 
 
-def codex_stop_on_auth_failure(name: str, line: str) -> bool:
-    return codex_authentication_failure(subprocess.CompletedProcess(
-        [], 1, line if name == "stdout" else "", line if name == "stderr" else "",
-    ))
+class CodexAuthFailureStopper:
+    def __init__(self) -> None:
+        self.failure_times: list[float] = []
+
+    def __call__(self, name: str, line: str) -> bool:
+        messages = [message.lower() for message in codex_error_messages(subprocess.CompletedProcess(
+            [], 1, line if name == "stdout" else "", line if name == "stderr" else "",
+        ))]
+        if any(marker in message for message in messages for marker in CODEX_AUTH_TERMINAL_MARKERS):
+            return True
+        if any(marker in message for message in messages for marker in CODEX_AUTH_RECOVERY_MARKERS):
+            # Allow Codex's reload/refresh recovery before stopping repeated 401s.
+            now = time.monotonic()
+            self.failure_times = [when for when in self.failure_times if now - when <= 60]
+            self.failure_times.append(now)
+            return len(self.failure_times) >= 3
+        return False
 
 
 def load_codex_auth_fallback_route(
@@ -5645,7 +5661,7 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                         stream_output=args.stream_engine_output,
                         stream_display=CodexStreamDisplay(suppress_diagnostics=command_auth, engine_stage=engine_stage) if args.stream_engine_output else None,
                         engine_stage=engine_stage,
-                        stop_on_output=codex_stop_on_auth_failure,
+                        stop_on_output=CodexAuthFailureStopper(),
                         env=codex_runtime_env(
                             repo,
                             runtime_root,

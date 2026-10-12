@@ -41,6 +41,8 @@ and [Codex reasoning modes](https://learn.chatgpt.com/docs/models#know-when-to-u
 Default: ChatGPT subscription; preserve only user authentication settings.
 Live authentication failure → stop attempt fast; retry pass once on operator's
 validated configured named command-auth route, including context + catalogue.
+Definite credential failure → immediate stop; generic auth failure → stop after
+3 lines within 60s. Single 401: allow Codex's reload/refresh recovery.
 Explicit provider / non-auth failure / no valid configured route: no auth fallback.
 Profile settings remain ignored. Force configured route before subscription attempt:
 

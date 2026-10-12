@@ -96,6 +96,7 @@ that refusal.
 - Default Codex auth: ChatGPT subscription; preserve only user auth settings.
 - Live auth failure → stop attempt fast. Retry pass once on operator's configured,
   validated named command-auth provider; print selected provider. No valid route → fail.
+- Live stop: definite credential failure immediately; generic auth failure ≥3 lines / 60s.
 - Explicit provider / non-auth failure: no automatic auth fallback.
 - Force configured route: `--codex-config 'model_provider="review_api"'`;
   `review_api` must match operator `CODEX_HOME/config.toml`.
