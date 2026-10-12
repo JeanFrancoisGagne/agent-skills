@@ -1,11 +1,11 @@
 # Untrusted AWS
 
-Use only when AWS semantics are required or explicitly requested and a lease is
-available immediately. Otherwise use secretless fork CI; never escalate providers.
+- Use only when AWS semantics required or explicitly requested + lease immediately
+  available. Otherwise: secretless fork CI. Never escalate providers.
 
-Clean trusted default-branch checkout. Installed trusted Crabbox binary. Fresh
-lease per reviewed full head SHA. No instance role. No Tailscale. No hydration.
-Only `CI` forwarded. Trusted bootstrap uploaded beside `--fresh-pr`.
+- Clean trusted default-branch checkout. Installed trusted Crabbox binary.
+- Fresh lease per reviewed full head SHA. No instance role, Tailscale, hydration.
+- Only `CI` forwarded. Trusted bootstrap uploaded beside `--fresh-pr`.
 
 ```sh
 cd <clean-trusted-default-branch-checkout>
@@ -43,9 +43,9 @@ env -u CRABBOX_AWS_INSTANCE_PROFILE \
   "$CRABBOX" stop --provider aws <cbx_id>
 ```
 
-The consumer-owned bootstrap proves the IMDSv2 IAM credential endpoint returns
-404, verifies the full SHA, removes inherited runtime injection variables,
-pins the repository toolchain, isolates `HOME`, installs, and tests.
+- Consumer-owned bootstrap: prove IMDSv2 IAM credential endpoint returns 404;
+  verify full SHA; remove inherited runtime injection variables; pin repository
+  toolchain; isolate `HOME`; install; test.
 
-Head moved? Stop. Rewarm. No reuse across revisions. No remote PR or no-role
-proof unavailable? Secretless fork CI. No exceptions.
+- Head moved: stop + rewarm. No reuse across revisions.
+- No remote PR or no-role proof unavailable: secretless fork CI. No exceptions.

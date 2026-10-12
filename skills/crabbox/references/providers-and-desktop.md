@@ -1,7 +1,7 @@
 # Provider and desktop recipes
 
-Read only for the selected provider or requested desktop/cross-OS proof.
-The [routing and proof rules](../SKILL.md#route-first) still apply: no provider
+Read only for selected provider or requested desktop/cross-OS proof.
+[Routing and proof rules](../SKILL.md#route-first) still apply: no provider
 escalation or waiting for capacity.
 
 ## Direct AWS
@@ -10,8 +10,8 @@ escalation or waiting for capacity.
 "$CRABBOX" run --provider aws --timing-json --shell -- "<check-command>"
 ```
 
-Stale sync: retry `--full-resync` once. Still bad: fresh lease. One-shot should
-stop itself; after failure/interruption verify `"$CRABBOX" list --provider aws`.
+- Stale sync: retry `--full-resync` once. Still bad: fresh lease.
+- One-shot should stop itself; failure/interruption: verify `"$CRABBOX" list --provider aws`.
 
 Broker auth, not cloud keys:
 
@@ -22,15 +22,15 @@ Broker auth, not cloud keys:
 "$CRABBOX" login --url <broker-url> --provider aws
 ```
 
-Normal validation asking for AWS keys usually means wrong path.
+Normal validation asks for AWS keys: usually wrong path.
 
 ## Fresh PR / Container
 
-`--fresh-pr <owner/repo#123>`: clean remote checkout. Add `--apply-local-patch`
-only for intentional local fixup. Direct providers only.
+- `--fresh-pr <owner/repo#123>`: clean remote checkout. `--apply-local-patch`
+  only for intentional local fixup. Direct providers only.
 
-Use local Docker only when the resolved configuration selects it or the user
-explicitly requests a local-container lane:
+Local Docker only when resolved configuration selects it or user explicitly
+requests local-container lane:
 
 ```sh
 "$CRABBOX" run \
@@ -41,8 +41,8 @@ explicitly requests a local-container lane:
   "<install-and-check-command>"
 ```
 
-Report `local-container`; not AWS/Testbox. Keep `--no-hydrate` and use a
-repository-local dependency cache when host-mounted caches cannot cross filesystems.
+- Report `local-container`; not AWS/Testbox. Keep `--no-hydrate`.
+- Host-mounted caches cannot cross filesystems: use repository-local dependency cache.
 
 ## Desktop / Cross-OS
 
@@ -57,11 +57,11 @@ Static hosts:
   --static-host <windows-host> -- <check-command>
 ```
 
-Windows/WSL2: prefer Azure when advertised/configured. Native Windows uses
-OpenSSH + PowerShell + Git + tar. Actions hydration Linux-only.
+- Windows/WSL2: prefer Azure when advertised/configured.
+- Native Windows: OpenSSH + PowerShell + Git + tar. Actions hydration Linux-only.
 
-Brokered macOS: paid EC2 Mac. First quota/no-spend preflight. No silent
-substitution for Linux proof.
+Brokered macOS: paid EC2 Mac. First quota/no-spend preflight.
+No silent substitution for Linux proof.
 
 ```sh
 "$CRABBOX" admin hosts quota --provider aws --target macos \
@@ -70,8 +70,8 @@ substitution for Linux proof.
   --region eu-west-1 --type mac2.metal --dry-run --json
 ```
 
-Human desktop: WebVNC preferred when the resolved provider supports it. Do not
-change providers only to gain desktop support.
+Human desktop: prefer WebVNC when resolved provider supports it.
+Never change providers only to gain desktop support.
 
 ```sh
 "$CRABBOX" warmup --desktop --browser --keep
@@ -82,12 +82,12 @@ change providers only to gain desktop support.
 "$CRABBOX" artifacts collect --id <id> --all --output artifacts/<slug>
 ```
 
-Before handoff, prove CLI/app from neutral `~`:
+Before handoff: prove CLI/app from neutral `~`:
 
 ```sh
 "$CRABBOX" run --id <id> --shell -- \
   "cd ~ && command -v <command> && <command> --version"
 ```
 
-Visible desktop alone proves nothing. Keep browser windowed unless capture task.
-Never commit proof assets to product repo.
+- Visible desktop alone proves nothing. Keep browser windowed unless capture task.
+- Never commit proof assets to product repo.

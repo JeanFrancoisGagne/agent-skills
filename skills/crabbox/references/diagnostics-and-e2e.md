@@ -10,18 +10,17 @@ Prefer built-ins:
 - `--allow-env NAME` + `--env-from-profile <file>`: exact direct-provider env.
 - `CRABBOX_ENV_ALLOW=NAME,...`: exact ambient env allowlist.
 - `--capture-stdout`, `--capture-stderr`: direct-provider local capture.
-- `--capture-on-fail`: test artifacts. Treat as secret-bearing until reviewed.
+- `--capture-on-fail`: test artifacts; secret-bearing until reviewed.
 - `--keep-on-failure`: retain failed lease for debugging.
 - `--results-auto` / `--junit <path>`: structured failure digest.
 - `CRABBOX_PHASE:<name>` lines: phase timing.
 
-Secrets: exact key only. One command. Never print. Never repo file. Never shell
-history. No safe injection path? Report live auth blocked. No fake-key upgrade to
-“live proof.”
+- Secrets: exact key only; one command. Never print, repo file, or shell history.
+- No safe injection path: report live auth blocked. No fake-key upgrade to “live proof.”
 
 ## Real E2E
 
-“Test in Crabbox” means user path, not merely remote unit tests.
+“Test in Crabbox” = user path, not merely remote unit tests.
 
 1. Reproduce entrypoint when feasible.
 2. Patch. Narrow local test.
@@ -33,19 +32,18 @@ history. No safe injection path? Report live auth blocked. No fake-key upgrade t
 Route:
 
 - Install/package: pack tarball; install like user; matching Docker/package lane.
-- Provider/auth: real provider. Scrub unrelated provider vars.
-- Integration: setup, config, send/receive, and inspect redacted logs.
+- Provider/auth: real provider; scrub unrelated provider vars.
+- Integration: setup, config, send/receive; inspect redacted logs.
 - Service/session/tool: real CLI or API; inspect persisted state and result.
 - Parser/config: focused tests enough only when OS/package/service cannot matter.
 
-Before/after: same Testbox when practical. Detached temp worktrees under `/tmp`.
-Never checkout refs in synced root. For native Testbox, prepare and compare both
-revisions within one synced invocation; later runs sync the local checkout again.
-Full-screen CLI: real PTY. Interactive Clack: exact arrows/Enter; raw search
-typing can lie.
-
-Use the consumer's documented temporary state/config directory so proof cannot
-mutate the operator's normal installation.
+- Before/after: same Testbox when practical. Detached temp worktrees under `/tmp`.
+  Never checkout refs in synced root.
+- Native Testbox: prepare/compare both revisions within one synced invocation;
+  later runs sync local checkout again.
+- Full-screen CLI: real PTY. Interactive Clack: exact arrows/Enter; raw search typing can lie.
+- Use consumer's documented temporary state/config directory; proof must never
+  mutate operator's normal installation.
 
 ## Failure Triage
 
@@ -62,15 +60,15 @@ blacksmith testbox list --all
 blacksmith testbox status --id <tbx_id>
 ```
 
-- Provider/CLI old: follow the consumer's trusted Crabbox update path.
+- Provider/CLI old: follow consumer's trusted Crabbox update path.
 - Config/auth: `config show`, `doctor`, `whoami`.
 - Sync quiet/stale: `--debug --timing-json`, then `--full-resync` once.
-- Testbox capacity: stop the task-owned request, report it, and run locally.
-  Never wait on the queue or chain providers.
+- Testbox capacity: stop task-owned request, report it, run locally.
+  Never wait on queue or chain providers.
 - Command failure: read phase, failed test, JUnit, skipped shell segment. Focused
   rerun first.
 - Cleanup unclear: list exact provider. Stop only owned ids.
-- Consumer wrapper broken: use the installed Crabbox CLI only to isolate the
-  wrapper, preserving the same resolved provider.
+- Consumer wrapper broken: installed Crabbox CLI only to isolate wrapper;
+  preserve same resolved provider.
 
-Crabbox stop does not accept `--timing-json`.
+Crabbox stop: no `--timing-json`.

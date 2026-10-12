@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Tighten Crabbox instructions and shared review references into terse wording while preserving rules, examples, commands, and anchors.
+
 - Shorten Autoreview and Crabbox's core instructions, move specialized guidance to on-demand references, and make CI/local-first proof with immediately available boxes explicit.
 
 - Default Autoreview's Codex reviewer to medium reasoning on the Ultrafast tier; `--thinking`, `--codex-speed`, their environment variables, and a raw `service_tier` override still take precedence.
