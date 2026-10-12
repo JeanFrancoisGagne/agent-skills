@@ -174,7 +174,7 @@ it or Codex is unavailable for the review; report the concrete availability fail
 before switching. Do not switch because a review is slow, rate-limited, or returns
 findings, or to bypass a safety refusal or isolation failure.
 
-Codex defaults to `gpt-6.1-sol`, high reasoning, with a single `gpt-6-sol` retry
+Codex defaults to `gpt-6.1-sol`, medium reasoning, Ultrafast tier, with a single `gpt-6-sol` retry
 only for an account-access failure. Explicit `gpt-6.1-sol` selections use the same
 retry. Explicit `gpt-6-sol` selections retain their access-only `gpt-6-luna` retry;
 other explicit models, including Luna and Astra, have no model fallback.
@@ -185,9 +185,10 @@ Honor explicit user engine/model choices.
 The helper does not automatically fall back between engines.
 
 Use `--engine`, `--model`, and `--thinking` to override the defaults.
-`--codex-speed fast` selects priority service when supported; `--codex-speed ultrafast`
-selects Ultrafast when the active model catalog lists it (Codex otherwise silently
-sends the standard tier). Only Claude accepts
+The Codex tier defaults to Ultrafast when the active model catalog lists it (Codex
+otherwise silently sends the standard tier); a raw `--codex-config service_tier=...`
+keeps its value. `--codex-speed fast` selects priority service, and
+`--codex-speed default` selects the standard tier. Only Claude accepts
 `--fallback-model`. Per-engine environment overrides use `AUTOREVIEW_<ENGINE>_*`.
 
 If your account cannot access Sol or Luna, pin an available model. To require
@@ -200,7 +201,7 @@ GPT-6 Astra without a model fallback, select it explicitly:
 GPT-6.1 Sol and GPT-6 Astra support `low`, `medium`, `high`, `xhigh`, and `max`;
 neither supports `none` or `minimal`. GPT-6 Sol and Luna additionally support `none`,
 but not `minimal`. AutoReview defaults to
-`high` and does not fall back from an explicit Luna or Astra selection.
+`medium` and does not fall back from an explicit Luna or Astra selection.
 Codex's `ultra` mode uses automatic
 delegation and is outside this helper's supported effort levels. Use `max`
 for its deepest supported review. For EU data residency, use

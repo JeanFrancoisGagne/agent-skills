@@ -417,7 +417,7 @@ DEFAULT_CODEX_ACCESS_FALLBACK_MODEL = "gpt-6-sol"
 AMP_THINKING_VALUES = frozenset({"none", "low", "medium", "high", "xhigh", "max"})
 DEFAULT_THINKING_BY_ENGINE = {
     "amp": "high",
-    "codex": "high",
+    "codex": "medium",
 }
 THINKING_LEVELS_BY_ENGINE = {
     "amp": set(AMP_THINKING_VALUES),
@@ -5342,12 +5342,16 @@ def codex_config_keys(args: argparse.Namespace) -> list[str]:
 
 
 CODEX_SPEEDS = ("fast", "ultrafast", "flex", "default")
+DEFAULT_CODEX_SPEED = "ultrafast"
 
 
 def codex_speed_override(args: argparse.Namespace) -> str | None:
     speed = getattr(args, "codex_speed", None) or os.environ.get("AUTOREVIEW_CODEX_SPEED", "").strip() or None
     if speed is None:
-        return None
+        # A raw --codex-config service_tier keeps working; otherwise default to Ultrafast.
+        if "service_tier" in codex_config_keys(args):
+            return None
+        speed = DEFAULT_CODEX_SPEED
     speed = speed.strip().lower()
     if speed not in CODEX_SPEEDS:
         raise SystemExit(f"invalid Codex speed: {speed} (valid: {', '.join(CODEX_SPEEDS)})")

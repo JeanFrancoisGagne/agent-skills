@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Default Autoreview's Codex reviewer to medium reasoning on the Ultrafast tier; `--thinking`, `--codex-speed`, their environment variables, and a raw `service_tier` override still take precedence.
+
 ## 0.5.0 - 2026-10-11
 
 **Highlights:** Start shared Gateway worktree sessions with the new team-handoff skill, use Ultrafast Autoreview, and share one review installation across repositories.

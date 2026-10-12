@@ -1717,13 +1717,26 @@ class AutoreviewExecutableDiscoveryTests(unittest.TestCase):
 
 
 class AutoreviewCompatibilityTests(unittest.TestCase):
-    def test_default_reviewer_uses_sol_61_high_with_sol_6_access_retry(self) -> None:
+    def test_default_reviewer_uses_sol_61_medium_ultrafast_with_sol_6_access_retry(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(sys, "argv", ["autoreview"]):
             reviewer = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
         self.assertEqual(reviewer.engine, "codex")
         self.assertEqual(reviewer.model, "gpt-6.1-sol")
-        self.assertEqual(reviewer.thinking, "high")
+        self.assertEqual(reviewer.thinking, "medium")
         self.assertEqual(reviewer.fallback_model, "gpt-6-sol")
+        self.assertEqual(AUTOREVIEW.codex_speed_override(reviewer), 'service_tier="ultrafast"')
+
+    def test_codex_speed_default_yields_to_explicit_and_raw_service_tier(self) -> None:
+        cases = (
+            (["--codex-speed", "fast"], {}, 'service_tier="fast"'),
+            ([], {"AUTOREVIEW_CODEX_SPEED": "default"}, 'service_tier="default"'),
+            (["--codex-config", 'service_tier="flex"'], {}, None),
+        )
+        for argv, env, expected in cases:
+            with self.subTest(argv=argv, env=env), mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch.object(sys, "argv", ["autoreview", *argv]):
+                reviewer = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
+                self.assertEqual(AUTOREVIEW.codex_speed_override(reviewer), expected)
 
     def test_sol_61_and_astra_reject_unsupported_effort_before_preparation(self) -> None:
         with tempfile.TemporaryDirectory(prefix="autoreview-invalid-effort.") as tempdir:
@@ -1822,7 +1835,7 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
                                 continue
                             reviewer = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
                         self.assertEqual(reviewer.model, model)
-                        self.assertEqual(reviewer.thinking, effort or "high")
+                        self.assertEqual(reviewer.thinking, effort or "medium")
                         self.assertEqual(reviewer.fallback_model, fallback)
 
     def test_astra_preserves_supported_effort_and_explicit_model(self) -> None:
@@ -1841,7 +1854,7 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
                     with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(sys, "argv", argv):
                         reviewer = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
                     self.assertEqual(reviewer.model, "gpt-6-astra")
-                    self.assertEqual(reviewer.thinking, effort or "high")
+                    self.assertEqual(reviewer.thinking, effort or "medium")
                     self.assertIsNone(reviewer.fallback_model)
 
     def test_astra_effort_restrictions_do_not_change_other_codex_models(self) -> None:
@@ -1902,7 +1915,8 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
                 self.assertEqual(kwargs["input_text"], prompt)
                 model = command[command.index("--model") + 1]
                 events.append(model)
-                self.assertIn('model_reasoning_effort="high"', command)
+                self.assertIn('model_reasoning_effort="medium"', command)
+                self.assertIn('service_tier="ultrafast"', command)
                 if model == "gpt-6.1-sol":
                     return subprocess.CompletedProcess(
                         command, 1, AutoreviewEfficiencyTests.usage_event(),
