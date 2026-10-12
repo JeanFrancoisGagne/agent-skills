@@ -4900,13 +4900,14 @@ def load_codex_inference_route(
     providers = config.get("model_providers", {})
     provider = providers.get(provider_id) if isinstance(providers, dict) else None
     if not isinstance(provider, dict) or set(provider) - {
-        "name", "base_url", "wire_api", "requires_openai_auth", "auth",
+        "name", "base_url", "wire_api", "requires_openai_auth", "supports_websockets", "auth",
     }:
         refuse("unsupported provider fields")
     if (
         provider.get("base_url") != "https://api.openai.com/v1"
         or provider.get("wire_api", "responses") != "responses"
         or provider.get("requires_openai_auth", False) is not False
+        or not isinstance(provider.get("supports_websockets", False), bool)
         or not isinstance(provider.get("name", ""), str)
     ):
         refuse("only command-auth OpenAI Responses routes are supported")

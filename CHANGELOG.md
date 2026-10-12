@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Accept and project `supports_websockets` on Autoreview's named command-auth OpenAI route, so reviews use the Responses WebSocket transport instead of re-uploading the full prompt on every step.
 - Skip Autoreview's first Codex subscription attempt when a local login-status probe confirms no login and a validated configured provider is available; keep subscription-first behavior on probe errors or timeouts.
 
 - Keep Autoreview's Codex subscription route first, allow 401 recovery before stopping repeated or definite authentication failures, and retry once on the operator's validated configured command-auth provider.

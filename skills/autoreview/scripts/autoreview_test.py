@@ -2234,14 +2234,23 @@ class AutoreviewAuthFallbackTests(unittest.TestCase):
         self.addCleanup(self.env.stop)
         self.failure = subprocess.CompletedProcess([], 1, "", "401 Unauthorized")
 
-    def configure_provider(self, *, base_url: str = "https://api.openai.com/v1") -> None:
+    def configure_provider(self, *, base_url: str = "https://api.openai.com/v1", extra: str = "") -> None:
         (self.home / "config.toml").write_text(
             'model_provider = "review_api"\n'
             '[model_providers.review_api]\n'
             f'base_url = {json.dumps(base_url)}\n'
+            f'{extra}'
             '[model_providers.review_api.auth]\n'
             f'command = {json.dumps(sys.executable)}\n',
         )
+
+    def test_route_projects_websocket_transport_and_rejects_non_boolean(self) -> None:
+        self.configure_provider(extra="supports_websockets = true\n")
+        flags, _catalogue = AUTOREVIEW.load_codex_inference_route(self.repo, ["model_provider=review_api"])
+        self.assertIn("model_providers.review_api.supports_websockets=true", flags)
+        self.configure_provider(extra='supports_websockets = "yes"\n')
+        with self.assertRaises(SystemExit):
+            AUTOREVIEW.load_codex_inference_route(self.repo, ["model_provider=review_api"])
 
     def test_authentication_markers_and_error_event_shapes(self) -> None:
         for marker in AUTOREVIEW.CODEX_AUTH_FAILURE_MARKERS:
