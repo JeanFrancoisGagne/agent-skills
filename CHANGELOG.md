@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add `autoreview --version` to identify the executing helper's source bytes without review preparation, configuration reads or output changes.
+
 - Preserve existing output files during Autoreview dry runs, including when target selection or preflight fails; real reviews still clear stale status before starting.
 
 - Make this repository's ClawSweeper reviews opt-in for maintainer PRs and issues, with a one-time reminder; clarify when agents should request hosted reviews in the shared Autoreview skill.
