@@ -68,6 +68,9 @@ python3 /path/to/shared-skills/autoreview/scripts/autoreview \
 ```
 
 On Windows, use `python` or the installed `scripts/autoreview.ps1` launcher.
+Both PowerShell launchers search native Python applications without importing
+PowerShell modules for missing candidates. They try `py -3`, `python3`, then
+`python`, and require Python 3.10 or newer.
 Existing native flags, executable selection, and trust checks still apply.
 Help does not contact a model. Dry-run checks source preparation and local
 executable capabilities; it does not prove model access or sandbox execution.
@@ -109,5 +112,19 @@ assets shipped with v0.5.0 from the current workflow.
 Installer tests cover copy/symlink replacement, rollback, outside-state retention,
 and the real copied helper's help path from a directory with spaces and Unicode.
 Symlink tests skip when Windows lacks permission to create links. This does not
-qualify Python 3.10/3.11, native Windows provider execution, optional Pillow/tomli
-paths, or model access. Those require their own platform/runtime proof.
+qualify native Windows provider execution or model access.
+
+The separate installed-source CI jobs check exact candidate tar/ZIP bytes against
+Git, then copy-install Autoreview outside the checkout. Ubuntu jobs exercise
+Python 3.10/3.11; Windows exercises the real copied PowerShell launcher. Each job
+uses a fresh Python environment before and after installing pinned Pillow/tomli
+proof dependencies. Tests decode a fixture PNG, parse fixture operator TOML, and
+check the actionable refusals when a required optional dependency is absent.
+Help, exact helper-byte `--version` identity, and a genuine unknown-option refusal
+run from a directory with spaces and Unicode; source, installation, and external state must remain unchanged.
+Windows profile and application-data directories are separate writable test
+paths; PowerShell may populate its own module cache there.
+
+These are no-model installation checks, not published-release certificates,
+live auth/scanner/sandbox tests, or coverage of every architecture. ZIP executable
+mode portability remains unqualified; Windows invokes the PowerShell launcher.

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Prevent both PowerShell review launchers from importing unrelated modules while searching for Python. Qualify copied source archives on Python 3.10/3.11 and native Windows PowerShell, including real optional Pillow/tomli branches without model calls.
+
 - Document pinned source installation and explicit upgrades/rollback; cover copy/symlink replacement, external state preservation, and installed Autoreview help without changing installer behavior.
 
 - Add optional Autoreview preflight summaries for clean committed branch reviews, preserving native reports, status, and exit codes without another model call or GitHub write.
