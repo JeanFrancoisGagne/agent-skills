@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Document pinned source installation and explicit upgrades/rollback; cover copy/symlink replacement, external state preservation, and installed Autoreview help without changing installer behavior.
+
 - Add optional Autoreview preflight summaries for clean committed branch reviews, preserving native reports, status, and exit codes without another model call or GitHub write.
 - Add `autoreview --version` to identify the executing helper's source bytes without review preparation, configuration reads or output changes.
 

@@ -138,6 +138,9 @@ this checkout once to update every symlinked consumer. Copy-mode installations
 need `python3 scripts/install-skills --mode copy --force autoreview` after the
 source update. Review runs do not download or update code automatically.
 
+For pinned source archives, upgrade/rollback steps, and copy-versus-symlink
+identity limits, see [source installation](docs/RELEASING.md#installing-a-pinned-source).
+
 To compare installed helper content, run
 `python3 ~/.agents/skills/autoreview/scripts/autoreview --version` (use your
 custom install path when applicable). The output is `autoreview source-sha256:`
