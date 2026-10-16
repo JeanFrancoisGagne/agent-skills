@@ -1640,6 +1640,164 @@ def position_in_ranges(
         for start, end in ranges
     )
 
+def swift_case_string_start(text, cursor):
+    end = cursor
+    while end < len(text) and text[end] == "#":
+        end += 1
+    if not text.startswith('"', end):
+        return None
+    quote = '"""' if text.startswith('"""', end) else '"'
+    hashes = text[cursor:end]
+    return end + len(quote), ("string", quote + hashes, "\\" + hashes)
+
+
+def swift_case_string_step(text, cursor, stack):
+    _, closing, escape = stack[-1]
+    # Extra closing hashes do not prove the native delimiter's exact boundary.
+    if text.startswith(closing, cursor) and (
+        not closing.endswith("#") or text[cursor + len(closing):cursor + len(closing) + 1] != "#"
+    ):
+        stack.pop()
+        return cursor + len(closing)
+    if not text.startswith(escape, cursor):
+        return cursor + 1
+    end = cursor + len(escape)
+    if text.startswith("(", end):
+        stack.append(("interpolation", 1))
+        return end + 1
+    return min(len(text), end + 1)
+
+
+def swift_case_comment_step(text, cursor, stack):
+    if text.startswith("/*", cursor):
+        stack.append(("comment",))
+        return cursor + 2
+    if text.startswith("*/", cursor):
+        stack.pop()
+        return cursor + 2
+    return cursor + 1
+
+
+def swift_case_comment_start(text, cursor, stack):
+    if text.startswith("//", cursor):
+        end = re.search(r"[\r\n]", text[cursor + 2:])
+        return len(text) if end is None else cursor + 2 + end.start()
+    if text.startswith("/*", cursor):
+        stack.append(("comment",))
+        return cursor + 2
+    return None
+
+
+def swift_case_nonstring_boundary(text, cursor):
+    if text[cursor] == "`":
+        end = text.find("`", cursor + 1)
+        if end < 0 or re.search(r"[\r\n]", text[cursor + 1:end]):
+            return -1
+        return end + 1
+    # Extended regex syntax has its own lexer. An unproved regex boundary cannot
+    # establish a case role; the existing raw assignment scans retain its bytes.
+    if re.compile(r"#+/").match(text, cursor):
+        return -1
+    return swift_case_slash_boundary(text, cursor)
+
+
+def swift_case_slash_boundary(text, cursor):
+    if text[cursor] != "/":
+        return None
+    # A bare Swift regex cannot begin with whitespace. Other slash forms remain
+    # unproved here so regex quotes cannot change the surrounding string state.
+    following = text[cursor + 1:cursor + 2]
+    return cursor + 1 if following in {" ", "\t", "\r", "\n"} else -1
+
+
+def swift_case_interpolation_step(text, cursor, stack):
+    if stack and stack[-1][0] == "interpolation":
+        depth = stack[-1][1] + (text[cursor] == "(") - (text[cursor] == ")")
+        if depth:
+            stack[-1] = ("interpolation", depth)
+        else:
+            stack.pop()
+    return cursor + 1
+
+
+def swift_case_code_step(text, cursor, stack):
+    end = swift_case_comment_start(text, cursor, stack)
+    if end is not None:
+        return end
+    opening = swift_case_string_start(text, cursor)
+    if opening is not None:
+        end, state = opening
+        stack.append(state)
+        return end
+    end = swift_case_nonstring_boundary(text, cursor)
+    if end is not None:
+        return end
+    return swift_case_interpolation_step(text, cursor, stack)
+
+
+def swift_case_syntax_step(text, cursor, stack):
+    if stack and stack[-1][0] == "string":
+        return swift_case_string_step(text, cursor, stack)
+    if stack and stack[-1][0] == "comment":
+        return swift_case_comment_step(text, cursor, stack)
+    return swift_case_code_step(text, cursor, stack)
+
+
+def swift_case_code_position(text, position):
+    # Interpolation expressions stay inside their parent string for this role.
+    # Only a fully closed native string/comment stack can authorize a case label.
+    cursor, stack = 0, []
+    while cursor < position:
+        cursor = swift_case_syntax_step(text, cursor, stack)
+        if cursor < 0:
+            return False
+    return cursor == position and not stack
+
+
+def case_label_code_position(text, position):
+    if not _CASE_LABEL_SOURCE_COMPLETE.get():
+        return False
+    suffix = Path(_CAPTURED_SOURCE_PATH.get() or "").suffix
+    if suffix == ".swift":
+        return swift_case_code_position(text, position)
+    if suffix in {".js", ".ts"}:
+        return javascript_binding_code(text)[position:position + 4] == "case"
+    # JSX text and other native dialects cannot borrow the JavaScript lexer.
+    # Their unproved case-looking matches retain the existing assignment checks.
+    return False
+
+
+def case_label_quote_pattern():
+    double = r'"(?:\\.|[^"\\\r\n])*"'
+    if Path(_CAPTURED_SOURCE_PATH.get() or "").suffix == ".swift":
+        return double
+    return "(?:" + double + r"|'(?:\\.|[^'\\\r\n])*')"
+
+
+def switch_case_label_end(text: str, start: int) -> int | None:
+    # A case label is branch syntax. Resume after its colon so a body assignment
+    # cannot disappear inside the regex match for the preceding label.
+    line = text.rfind("\n", 0, start) + 1
+    prefix = text[line:start]
+    quoted = case_label_quote_pattern()
+    if re.fullmatch(r"[ \t]*case[ \t]+(?:" + quoted + r"[ \t]*,[ \t]*)*", prefix) is None:
+        return None
+    word = line + len(prefix) - len(prefix.lstrip())
+    if not case_label_code_position(text, word):
+        return None
+    label = re.match(quoted + r"[ \t]*:", text[start:])
+    return start + label.end() if label else None
+
+
+def source_assignment_matches(pattern: re.Pattern[str], text: str):
+    cursor = 0
+    while (match := pattern.search(text, cursor)) is not None:
+        label_end = switch_case_label_end(text, match.start())
+        if label_end is None:
+            yield match
+        cursor = label_end if label_end is not None else match.end()
+
+
 def secret_assignment_matches(
     pattern: re.Pattern[str],
     text: str,
@@ -1648,12 +1806,12 @@ def secret_assignment_matches(
 ) -> tuple[re.Match[str], ...]:
     matches: list[re.Match[str]] = []
     spans: set[tuple[int, int]] = set()
-    for match in pattern.finditer(text):
+    for match in source_assignment_matches(pattern, text):
         if position_in_ranges(match.start(), safe_ranges):
             continue
         matches.append(match)
         spans.add(match.span())
-    for match in pattern.finditer(masked_text):
+    for match in source_assignment_matches(pattern, masked_text):
         if match.span() not in spans:
             matches.append(match)
     return tuple(matches)
@@ -2476,6 +2634,7 @@ def role_marked_synthetic_secret_fixture(value: str, normalized_key: str) -> boo
 
 _CAPTURED_SOURCES = contextvars.ContextVar('captured_source_inputs', default=())
 _CAPTURED_SOURCE_PATH = contextvars.ContextVar('captured_source_path', default=None)
+_CASE_LABEL_SOURCE_COMPLETE = contextvars.ContextVar('case_label_source_complete', default=True)
 
 
 @contextlib.contextmanager
@@ -2637,7 +2796,36 @@ def javascript_captured_primitive_result(expression, text):
     return summary is not None and summary[1]
 
 
+def javascript_vitest_read_only_call(text, code, opening):
+    target = re.search(r'(?<![\w$.])([A-Za-z_$][\w$]*)\.(mock|hoisted|fn)$', code[:opening].rstrip())
+    if target is None:
+        return False
+    root = target.group(1)
+    imported = False
+    for declaration in re.finditer(r'\bimport\s*\{([^}]+)\}\s*from\s*(["\x27])vitest\2', text):
+        if code[declaration.start():declaration.start() + 6] != 'import':
+            continue
+        for field in declaration.group(1).split(','):
+            name = re.fullmatch(r'\s*(vi|vitest)(?:\s+as\s+([A-Za-z_$][\w$]*))?\s*', field)
+            imported |= name is not None and (name.group(2) or name.group(1)) == root
+    if not imported or javascript_code_parameter(code, root) or javascript_binding_initializers(text, code, root) or javascript_binding_mutation_risk(text, code, root):
+        return False
+    end = javascript_balanced_binding_end(code, opening, '(', ')')
+    if end is None:
+        return False
+    arguments = split_top_level_call_arguments(text[opening + 1:end - 1])
+    # These Vitest APIs create or read functions without mutating their receiver
+    # or captured exports. Every factory body and later write stays scanned.
+    method = target.group(2)
+    if method == 'fn':
+        return len(arguments) == 1 and not arguments[0].strip()
+    factory = 1 if method == 'mock' else 0
+    return len(arguments) == factory + 1 and javascript_code_arrow_parts(arguments[factory]) is not None
+
+
 def javascript_captured_read_only_call(text, code, opening):
+    if javascript_vitest_read_only_call(text, code, opening):
+        return True
     prefix = code[:opening].rstrip()
     target = re.search(r'(?<![\w$.])([A-Za-z_$][\w$]*)$', prefix)
     current = _CAPTURED_SOURCE_PATH.get()
@@ -4398,12 +4586,29 @@ def javascript_parenthesized_parameters(code: str, endings: dict[int, int], clos
     return javascript_parameter_bindings(code, start + 1, closing - 1) if start is not None else None
 
 
+def javascript_trailing_word_start(code, end):
+    begin = end
+    while begin and (code[begin - 1].isalnum() or code[begin - 1] in '_$'):
+        begin -= 1
+    return begin
+
+
+def javascript_method_name(code, start):
+    end = start
+    while end and code[end - 1].isspace():
+        end -= 1
+    begin = javascript_trailing_word_start(code, end)
+    # Match only the trailing word, retaining the original left boundary.
+    # Searching every preceding source prefix makes large modules quadratic.
+    return re.compile(r'(?<![\w$.])([A-Za-z_$][\w$]*)\s*$').match(code, begin, start)
+
+
 def javascript_method_parameter_bindings(code, pairs):
     bindings = {}
     for start, end in pairs.items():
         if code[start] != '(':
             continue
-        name = re.search(r'(?<![\w$.])([A-Za-z_$][\w$]*)\s*$', code[:start])
+        name = javascript_method_name(code, start)
         if name is None or name.group(1) in {'if', 'for', 'while', 'switch', 'catch', 'with', 'function'}:
             continue
         before = code[:name.start()].rstrip()
@@ -4685,6 +4890,12 @@ def javascript_binding_annotation_ranges(code):
     return tuple(annotations)
 
 def javascript_binding_initializers(text: str, code: str, root: str | None = None, *, preserve_callable: bool = False) -> list[str]:
+    # Callers own their list; the cached lexical parse contains immutable bytes.
+    return list(javascript_binding_initializer_values(text, code, root, preserve_callable=preserve_callable))
+
+
+@functools.lru_cache(maxsize=128)
+def javascript_binding_initializer_values(text: str, code: str, root: str | None = None, *, preserve_callable: bool = False) -> tuple[str, ...]:
     # Balanced annotations establish the initializer boundary only. Their type
     # names do not establish primitive contents or remove runtime literal bytes.
     name = re.escape(root) if root is not None else r'[A-Za-z_$][A-Za-z0-9_$]*'
@@ -4699,7 +4910,7 @@ def javascript_binding_initializers(text: str, code: str, root: str | None = Non
         expression = fallback_expression(text[end:], typescript=True)
         origins = None if preserve_callable else javascript_arrow_return_origins(expression)
         values.extend([expression] if origins is None else origins)
-    return values
+    return tuple(values)
 
 
 
@@ -4777,6 +4988,7 @@ def javascript_local_return_origins(parameters: str, body: str) -> list[str]:
         expressions.extend(javascript_binding_initializers(parameters, javascript_binding_code(parameters)))
     return expressions
 
+@functools.lru_cache(maxsize=128)
 def javascript_initializer_value_code(expression: str) -> str:
     code = javascript_binding_code(javascript_inline_type_text(expression))
     # Named TypeScript assertions describe types, not credential value origins.
@@ -4804,7 +5016,7 @@ def javascript_grouped_member_code(code):
 
 def javascript_grouped_member_replacement(code, match):
     prefix = code[:match.start()].rstrip()
-    callee = re.search(r"[A-Za-z_$][\w$]*$", prefix)
+    callee = re.compile(r"[A-Za-z_$][\w$]*$").search(prefix, javascript_trailing_word_start(prefix, len(prefix)))
     if prefix.endswith((")", "]")) or (callee is not None and callee.group() not in {"typeof", "return", "throw", "void", "delete", "await"}):
         return match.group()
     # Typed callees and function headers own their parameter parentheses.
@@ -5507,10 +5719,10 @@ def javascript_conditional_colon_positions(code) -> set[int]:
 
 
 def field_kind_synthetic_secret_fixture(value: str, normalized_key: str) -> bool:
+    # Compound fields keep the explicit fixture marker. Other prefixes must
+    # name the complete field instead of borrowing its final credential kind.
     kind = normalized_key.rsplit("-", 1)[-1]
-    return kind in {"key", "token", "secret", "password", "credential", "credentials"} and any(
-        value == f"{prefix}-{kind}" for prefix in SYNTHETIC_SECRET_PREFIXES
-    )
+    return kind in {"key", "token", "secret", "password", "credential", "credentials"} and value == f"fixture-{kind}"
 
 
 def numbered_synthetic_secret_fixture(value: str, normalized_key: str) -> bool:
@@ -5532,6 +5744,15 @@ def javascript_fixture_origin_text(expression) -> str:
 
 
 def javascript_selected_mutation_risk(text, code, parts) -> bool:
+    # Captured callees can change the decision. Include the complete capture
+    # and active source owner so an earlier safe module cannot authorize another.
+    return javascript_selected_mutation_decision(
+        text, code, tuple(parts), _CAPTURED_SOURCES.get(), _CAPTURED_SOURCE_PATH.get())
+
+
+@functools.lru_cache(maxsize=128)
+def javascript_selected_mutation_decision(text, code, parts, sources, source_path) -> bool:
+    parts = list(parts)
     # Selected members ignore sibling metadata writes, but whole replacements,
     # computed writes and Object/Reflect operations still need a proved origin.
     code = javascript_initializer_value_code(code)
@@ -5603,6 +5824,8 @@ def javascript_selected_receiver_call(text, code, pairs, start, carrier):
     if members is None:
         return True
     end, _ = members
+    if code[end:end + 1] == '(' and javascript_vitest_read_only_call(text, code, end):
+        return False
     return javascript_selected_grouped_receiver_call(text, code, end, carrier or end > start)
 
 def javascript_selected_unproved_carriers(text, code, root, proved):
@@ -5664,6 +5887,8 @@ def javascript_selected_argument_context(text, code):
 
 def javascript_selected_argument_callee(prefix):
     prefix = prefix.rstrip()
+    if prefix.endswith('=>'):
+        return False
     name = re.search(r"[A-Za-z_$][\w$]*$", prefix)
     if name is not None and not prefix[:name.start()].rstrip().endswith(".") and name.group() in {"if", "while", "for", "switch", "catch", "with", "typeof", "void", "delete", "function", "return", "throw"}:
         return False
@@ -6364,17 +6589,25 @@ def javascript_code_imported_name(text, code, root):
     return False
 
 
-@functools.lru_cache(maxsize=128)
-def javascript_code_parameter(code, root):
+@functools.lru_cache(maxsize=8)
+def javascript_code_parameter_names(code):
     pairs = javascript_scope_pairs(code)
     if pairs is None:
-        return False
+        return frozenset()
     owners = [javascript_named_function_bindings(code, pairs),
               javascript_arrow_parameter_bindings(code, pairs),
               javascript_method_parameter_bindings(code, pairs)]
-    return all(owner is not None for owner in owners) and any(
-        name == root and position < body
-        for owner in owners for position, (body, name) in owner.items())
+    if any(owner is None for owner in owners):
+        return frozenset()
+    # This parse depends only on immutable source bytes, never capture authority.
+    # Cache the complete result so each queried root does not reparse the module.
+    return frozenset(name for owner in owners
+                     for position, (body, name) in owner.items() if position < body)
+
+
+@functools.lru_cache(maxsize=128)
+def javascript_code_parameter(code, root):
+    return root in javascript_code_parameter_names(code)
 
 
 def javascript_code_method_container(expression):
@@ -6773,6 +7006,15 @@ def javascript_code_captured_parameter_values(text, code, root, selection, ances
 
 
 def javascript_code_symbol_reference(text, reference, called=False, ancestors=frozenset(), unproved_callables=frozenset(), external_argument=False):
+    return javascript_code_symbol_decision(
+        text, reference, called, ancestors, unproved_callables, external_argument,
+        _CAPTURED_SOURCES.get(), _CAPTURED_SOURCE_PATH.get())
+
+
+@functools.lru_cache(maxsize=128)
+def javascript_code_symbol_decision(text, reference, called, ancestors, unproved_callables, external_argument, sources, source_path):
+    # Keep the exact ancestry, invocation role and complete captured sources in
+    # the key. A result from another scope or cycle budget cannot authorize this one.
     # This proves captured source syntax, not the contents or purity of runtime
     # parameters. Source-owned writes, defaults and captured returns retain all
     # literal origins. Data objects keep the selected-value/mutation proof.
@@ -6809,7 +7051,7 @@ def javascript_code_symbol_reference(text, reference, called=False, ancestors=fr
     captured_callable = declarations or symbolic or called or external_argument
     if captured_callable and javascript_code_unproved_rebinding(text, code, root, owned_declaration=destructured_symbol):
         return False
-    rebindings = javascript_binding_initializers(text, javascript_initializer_value_code(text), root, preserve_callable=bool(called)) if captured_callable else []
+    rebindings = javascript_binding_initializers(text, javascript_initializer_value_code(text), root, preserve_callable=bool(called or external_argument)) if captured_callable else []
     if rebindings:
         rebindings = javascript_selected_expressions(rebindings, selection)
         if rebindings is None:
@@ -6820,6 +7062,11 @@ def javascript_code_symbol_reference(text, reference, called=False, ancestors=fr
         if replacement is not True:
             return replacement
     if destructured_symbol:
+        # A whole destructured value retains its initializer's sibling writes
+        # and origin limit. Selected members keep the narrower mutation proof
+        # below so unrelated scalar metadata does not become their value.
+        if not selection and javascript_binding_literal_risk(text, code, reference):
+            return False
         if selection and javascript_selected_mutation_risk(text, code, parts):
             return False
         return javascript_code_symbol_values(text, destructured + writes, ancestors, selection[-1] if selection else None, root, called=called, unproved_callables=unproved_callables, external_argument=external_argument)
@@ -6830,6 +7077,13 @@ def javascript_code_symbol_reference(text, reference, called=False, ancestors=fr
         values = javascript_binding_initializers(text, code, root)
         values = javascript_selected_expressions(values, selection)
         return javascript_code_symbol_values(text, values + writes + effects, ancestors, selection[-1] if selection else None, root, called=called, unproved_callables=unproved_callables, external_argument=external_argument) if values is not None else None
+    if called and selection:
+        aliases = javascript_binding_initializers(text, code, root, preserve_callable=True)
+        if aliases and all(javascript_code_runtime_alias(text, code, value, ancestors) for value in aliases):
+            # Calling a member through a parameter alias keeps the parameter's
+            # CODE role. Retain actual writes and captured mutator effects.
+            effects = javascript_code_captured_parameter_values(text, code, root, selection, ancestors)
+            return False if effects is None else javascript_code_symbol_values(text, rebindings + writes + effects, ancestors, called=called, unproved_callables=unproved_callables, external_argument=external_argument)
     if declarations and selection:
         # A function object can escape to a captured mutator just like an object.
         # Prove its selected member before borrowing the return-origin role.
@@ -6875,7 +7129,7 @@ def javascript_code_symbol_reference(text, reference, called=False, ancestors=fr
 
     if global_reference:
         return javascript_code_symbol_values(text, writes, ancestors, selection[-1] if selection else None, called=called, unproved_callables=unproved_callables, external_argument=external_argument)
-    values = javascript_binding_initializers(text, code, root, preserve_callable=bool(called))
+    values = javascript_binding_initializers(text, code, root, preserve_callable=bool(called or external_argument))
     if not values:
         # An undeclared external reference submits code, not runtime contents.
         # Own declarations and unresolved or mutated carriers cannot borrow that
@@ -6898,11 +7152,9 @@ def javascript_code_symbol_reference(text, reference, called=False, ancestors=fr
         call_result = None not in origins and any(source_call(branch) for branch in branches) and all(
             javascript_code_symbol_expression(text, branch, ancestors, root, unproved_callables=unproved_callables, external_argument=external_argument) is True for branch in branches)
         if call_result:
-            projection = javascript_code_symbol_values(text, selected + writes, ancestors, selected_key=selection[-1], owner=root, unproved_callables=unproved_callables, external_argument=external_argument) if selected is not None else None
-            if projection is False:
-                return False
             # CODE origins retain the balanced call and complete returns. DATA
-            # projection otherwise turns a selected result into callee.member.
+            # projection otherwise mistakes the result for a callee member.
+            # The final owner still checks this result's writes and escapes.
             selected = values
         elif selected is None:
             literal = any(javascript_expression_has_literal(javascript_origin_selector_text(text, value, root)) for value in values)
@@ -6933,6 +7185,13 @@ def javascript_code_symbol_reference(text, reference, called=False, ancestors=fr
 
 
 
+
+
+def javascript_code_runtime_alias(text, code, value, ancestors):
+    if re.fullmatch(URI_CREDENTIAL_REFERENCE_TEXT, value.strip()) is None:
+        return False
+    base = re.match(r'[A-Za-z_$][\w$]*', value.strip()).group()
+    return (javascript_code_parameter(code, base) or javascript_code_imported_name(text, code, base)) and javascript_code_symbol_expression(text, value, ancestors) is True
 
 
 def javascript_code_symbol_values(text, expressions, ancestors, selected_key=None, owner=None, called=False, unproved_callables=frozenset(), external_argument=False):
@@ -7167,6 +7426,8 @@ def javascript_code_symbol_expression(text, expression, ancestors=frozenset(), o
     if javascript_syntax_boolean_expression(expression):
         return True
     if expression.strip() == '{}' or re.fullmatch(r'\s*(?:null|undefined|true|false|[+-]?(?:[0-9]+(?:\.[0-9]+)?))\s*', expression):
+        return True
+    if not called and javascript_imported_entropy_origin(text, javascript_binding_code(text), expression):
         return True
     if javascript_expression_has_literal(expression):
         return False
@@ -7993,6 +8254,10 @@ def javascript_scoped_code_expression(text, start, expression):
 
 
 def javascript_scoped_value_reference(text, start, value) -> bool:
+    # A member chain needs a declared owner. Bare identifiers retain their
+    # existing lexical CODE checks instead of inventing a member's origin.
+    if '.' in value:
+        return declared_javascript_secret_reference(text, start, value)
     scoped, selected = javascript_scoped_reference_graph(text, start, value)
     owned = javascript_code_symbol_expression(scoped, selected)
     if owned is None:
@@ -8304,11 +8569,16 @@ def python_control_header_colon(text, row):
     return python_control_prefix_span(text, row, colon)
 
 def python_control_prefix_span(text, row, colon):
+    prefixes = SECRET_ASSIGNMENT_PREFIX_PATTERN.finditer(row.group())
+    span = next(((row.start() + p.start(), colon + 1) for p in prefixes
+                 if p.end() >= colon - row.start() + 1 and p.group().rstrip().endswith(":")), None)
+    # Most control headers contain no credential field. Reject those before
+    # rescanning the whole module; every candidate still needs its quote context.
+    if span is None:
+        return None
     if string_contexts_at(text, {colon})[colon] is not None:
         return None
-    prefixes = SECRET_ASSIGNMENT_PREFIX_PATTERN.finditer(row.group())
-    return next(((row.start() + p.start(), colon + 1) for p in prefixes
-                 if p.end() >= colon - row.start() + 1 and p.group().rstrip().endswith(":")), None)
+    return span
 
 
 def python_assignment_in_code(text: str, position: int) -> bool:
@@ -8486,6 +8756,8 @@ def python_public_literal_argument(
 ) -> bool:
     if not isinstance(argument, ast.Constant):
         return False
+    if keyword is None and python_path_separator_argument(part, index):
+        return True
     target = ast.get_source_segment(expression, part.func) or ""
     index = python_public_argument_index(target, index, keyword)
     if index != 0:
@@ -8494,6 +8766,16 @@ def python_public_literal_argument(
     if keyword is not None:
         raw = f"{keyword}={raw}"
     return public_call_argument_risk(target, raw, index) is False
+
+
+def python_path_separator_argument(part: ast.Call, index: int) -> bool:
+    # The two separator literals normalize a path. Keep the receiver, extra
+    # arguments and every other replacement pair in the strict literal walk.
+    return all((
+        isinstance(part.func, ast.Attribute), getattr(part.func, "attr", None) == "replace",
+        index in (0, 1), len(part.args) == 2, not part.keywords,
+        all(isinstance(value, ast.Constant) for value in part.args),
+    )) and [value.value for value in part.args] == ["\\", "/"]
 
 def python_call_literal_nodes(expression: str, part: ast.Call):
     yield part.func
@@ -8777,14 +9059,36 @@ def python_boolean_literal_with_comma(expression: str, node: ast.AST) -> bool:
         re.fullmatch(r"(?:True|False)[ \t\r\n]*,", expression) is not None,
     ))
 
+def python_boolean_operand_risk(part: ast.AST, inspect, depth: int) -> bool | None:
+    # Existing complete placeholder literals carry no credential bytes. This role
+    # belongs to a direct Boolean operand, never a call argument or concatenation.
+    if isinstance(part, ast.Constant) and isinstance(part.value, str):
+        if part.value.lower() in SECRET_PLACEHOLDER_VALUES:
+            return False
+    return inspect(part, depth=depth + 1)
+
+
+def python_boolean_reference_risk(part: ast.BoolOp, inspect, depth: int) -> bool | None:
+    risks = [python_boolean_operand_risk(value, inspect, depth) for value in part.values]
+    if True in risks:
+        return True
+    return None if None in risks else False
+
+
+def python_scalar_or_boolean_reference_risk(part, selector: bool, inspect, depth: int):
+    if isinstance(part, ast.Constant):
+        return python_constant_reference_risk(part, selector)
+    return python_boolean_reference_risk(part, inspect, depth)
+
+
 def python_reference_risk(
     expression: str, node: ast.expr, *, random_byte_metadata: bool = False,
 ) -> bool | None:
     def inspect(part: ast.AST, *, selector: bool = False, depth: int = 0) -> bool | None:
         if depth > 64:
             return None
-        if isinstance(part, ast.Constant):
-            return python_constant_reference_risk(part, selector)
+        if isinstance(part, (ast.Constant, ast.BoolOp)):
+            return python_scalar_or_boolean_reference_risk(part, selector, inspect, depth)
         if python_named_reference(part):
             return False
         if isinstance(part, (ast.BinOp, ast.JoinedStr)):
@@ -9002,6 +9306,8 @@ def python_assignment_reference_prefixes(text: str, prefix, contexts, literal_pr
     if parsed is None:
         return set()
     expression, node = parsed
+    python_project_regex_patterns(text, node)
+    python_project_source_suffixes(node)
     risk = python_reference_risk(expression, node, random_byte_metadata=random_byte_metadata)
     if risk is True:
         return None
@@ -9012,6 +9318,235 @@ def python_assignment_reference_prefixes(text: str, prefix, contexts, literal_pr
         ))
         return references
     return set()
+
+
+def python_project_source_suffixes(node: ast.AST) -> None:
+    for part in ast.walk(node):
+        if not (isinstance(part, ast.Compare) and len(part.ops) == 1
+                and isinstance(part.ops[0], ast.Eq) and len(part.comparators) == 1):
+            continue
+        left, right = part.left, part.comparators[0]
+        if not (isinstance(left, ast.Attribute) and left.attr == "suffix"
+                and isinstance(left.value, ast.Call) and len(left.value.args) == 1
+                and not left.value.keywords and isinstance(left.value.func, ast.Name)
+                and left.value.func.id == "Path" and isinstance(right, ast.Constant)
+                and right.value in (".py", ".json", ".go")):
+            continue
+        # These are the existing Python/JSON/Go source dispatch suffixes.
+        # Only the comparison operand is metadata; path input and branches stay checked.
+        part.comparators[0] = ast.copy_location(ast.Constant(value=None), right)
+
+
+def python_regex_grammar_pattern(value: str) -> bool:
+    # Character ranges and regex operators describe grammar. Literal letters,
+    # encoded characters and singleton letter classes can carry credentials.
+    if not value or not value.isascii():
+        return False
+    unit = re.compile(
+        r"\[(?:A-Z|a-z|0-9|\\[wdsWDS]|\\[^A-Za-z0-9]|[^A-Za-z0-9\\\]])+\]"
+        r"|\\[wdsWDS]|\(\?(?:[:=!]|<[=!])|[().*+?^$|]|\{[0-9]+(?:,[0-9]*)?\}|\\[^A-Za-z0-9]"
+    )
+    cursor = 0
+    broad_class = False
+    parts = []
+    markers = []
+    while cursor < len(value):
+        part = unit.match(value, cursor)
+        if part is None:
+            part = re.match(r"\[([A-Za-z])([A-Za-z])\]", value[cursor:])
+            if part is None or part[1].swapcase() != part[2]:
+                return False
+            markers.append((len(parts), part[1].lower()))
+        raw = part.group()
+        parts.append(raw)
+        broad_class |= any(item in raw for item in ("A-Z", "a-z", "0-9", r"\w", r"\d", r"\s", r"\W", r"\D", r"\S"))
+        cursor += len(raw)
+    if not broad_class or not python_regex_numeric_markers(parts, markers):
+        return False
+    try:
+        re.compile(value)
+    except (re.error, OverflowError, RecursionError):
+        return False
+    return True
+
+
+def python_regex_numeric_markers(parts, markers) -> bool:
+    # One case-folded numeric marker may separate numeric operands. Adjacent
+    # letter classes or several distinct letters can encode credential text.
+    if len({letter for _, letter in markers}) > 1:
+        return False
+    return all(python_regex_numeric_neighbor(reversed(parts[:index]))
+               and python_regex_numeric_suffix(parts[index + 1:])
+               for index, _ in markers)
+
+
+def python_regex_numeric_neighbor(parts) -> bool:
+    for raw in parts:
+        if raw in ("[0-9]", r"\d", r"[\d]"):
+            return True
+        if raw.startswith("{"):
+            continue
+        if raw == "|" or any(char.isalnum() for char in raw):
+            return False
+    return False
+
+
+def python_regex_numeric_suffix(parts) -> bool:
+    # A numeric marker cannot repeat by itself or borrow an optional/empty
+    # operand. Only an optional sign may precede its required numeric atom.
+    if parts[:1] in (["[+-]"], ["[-+]"]):
+        parts = parts[1:]
+        if parts[:1] == ["?"]:
+            parts = parts[1:]
+    if not parts or parts[0] not in ("[0-9]", r"\d", r"[\d]"):
+        return False
+    quantifier = parts[1] if len(parts) > 1 else ""
+    return quantifier not in ("*", "?") and re.fullmatch(r"\{0+(?:,[0-9]*)?\}", quantifier) is None
+
+
+@functools.lru_cache(maxsize=16)
+def python_stdlib_regex_source(text: str) -> bool:
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError):
+        return False
+    if not python_regex_module_import(tree):
+        return False
+    return not python_regex_tree_namespace_risk(tree)
+
+
+def python_regex_module_import(tree: ast.Module) -> bool:
+    return any(alias.name == "re" and alias.asname is None
+               for part in tree.body if isinstance(part, ast.Import)
+               for alias in part.names)
+
+
+def python_regex_tree_namespace_risk(tree: ast.Module) -> bool:
+    parents = {child: part for part in ast.walk(tree) for child in ast.iter_child_nodes(part)}
+    imports = python_dynamic_namespace_bindings(tree)
+    return any(python_regex_namespace_risk(part, parents) or
+               python_dynamic_namespace_reference_risk(part, parents, imports)
+               for part in ast.walk(tree))
+
+
+def python_dynamic_namespace_module(module: str) -> str | None:
+    # importlib exposes its frozen bootstrap modules under their own import names.
+    # They carry the same loader capability, including through renamed imports.
+    root = module.split(".")[0]
+    if root in {"importlib", "_frozen_importlib", "_frozen_importlib_external"}:
+        return "lookup"
+    return {"sys": "sys", "builtins": "builtins"}.get(root)
+
+
+def python_dynamic_namespace_member(module: str, member: str) -> str | None:
+    # A loader or the module cache can reach the same object as a direct import.
+    # Withhold metadata when that capability is read, called or passed elsewhere.
+    if python_dynamic_namespace_module(module) == "lookup":
+        return "lookup"
+    members = {"sys": {"modules"}, "builtins": {
+        "__import__", "exec", "eval", "globals", "locals", "vars", "getattr", "setattr", "delattr",
+    }}
+    return "lookup" if member in members.get(module, ()) else None
+
+
+def python_dynamic_namespace_import(part: ast.AST, alias: ast.alias) -> tuple[str, str] | None:
+    if isinstance(part, ast.Import):
+        name = alias.asname or alias.name.split(".")[0]
+        owner = python_dynamic_namespace_module(alias.name)
+    else:
+        name = alias.asname or alias.name
+        owner = python_dynamic_namespace_member(part.module or "", alias.name)
+    return (name, owner) if owner else None
+
+
+def python_dynamic_namespace_bindings(tree: ast.Module) -> dict[str, set[str]]:
+    bindings: dict[str, set[str]] = {"__builtins__": {"builtins"}}
+    for part in ast.walk(tree):
+        if not isinstance(part, (ast.Import, ast.ImportFrom)):
+            continue
+        for alias in part.names:
+            binding = python_dynamic_namespace_import(part, alias)
+            if binding is not None:
+                name, owner = binding
+                bindings.setdefault(name, set()).add(owner)
+    return bindings
+
+
+def python_dynamic_namespace_owner_risk(part: ast.Name, parent: ast.AST | None, owner: str) -> bool:
+    if owner == "lookup" or not isinstance(part.ctx, ast.Load):
+        return True
+    # Attribute reads can retain unrelated sys/builtins metadata. A namespace
+    # alias, computed access or function escape cannot borrow that direct proof.
+    if not (isinstance(parent, ast.Attribute) and isinstance(parent.ctx, ast.Load)):
+        return True
+    return parent.attr.startswith("_") or python_dynamic_namespace_member(owner, parent.attr) is not None
+
+
+def python_dynamic_namespace_reference_risk(part: ast.AST, parents: dict, bindings: dict) -> bool:
+    if not isinstance(part, ast.Name):
+        return False
+    return any(python_dynamic_namespace_owner_risk(part, parents.get(part), owner)
+               for owner in bindings.get(part.id, ()))
+
+
+def python_regex_namespace_risk(part: ast.AST, parents: dict) -> bool:
+    if isinstance(part, (ast.Import, ast.ImportFrom)):
+        if isinstance(part, ast.ImportFrom) and part.module == "re":
+            return True
+        return any(alias.name == "*" or (alias.name == "re" and alias.asname is not None) or (
+            (alias.asname or alias.name.split(".")[0]) == "re" and not (
+                isinstance(part, ast.Import) and alias.name == "re" and alias.asname is None
+            )
+        ) for alias in part.names)
+    if isinstance(part, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.arg,
+                         ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+        return getattr(part, "name", getattr(part, "arg", None)) == "re"
+    if isinstance(part, ast.MatchMapping):
+        return part.rest == "re"
+    if isinstance(part, ast.Name) and part.id == "re":
+        parent = parents.get(part)
+        return not (isinstance(part.ctx, ast.Load) and isinstance(parent, ast.Attribute)
+                    and isinstance(parent.ctx, ast.Load))
+    if isinstance(part, ast.Call) and isinstance(part.func, ast.Name):
+        return part.func.id in {"exec", "eval", "globals", "locals", "vars", "__import__", "setattr", "delattr"}
+    if isinstance(part, ast.Attribute):
+        if (isinstance(part.value, ast.Name) and part.value.id == "sys" and part.attr == "modules"):
+            return True
+        base = part.value
+        while isinstance(base, ast.Attribute):
+            base = base.value
+        if isinstance(base, ast.Name) and base.id == "re":
+            if not isinstance(part.ctx, ast.Load) or part.attr.startswith("_"):
+                return True
+            if part.attr in {"Match", "Pattern", "A", "ASCII", "I", "IGNORECASE", "L", "LOCALE",
+                             "M", "MULTILINE", "S", "DOTALL", "U", "UNICODE", "X", "VERBOSE", "NOFLAG", "DEBUG"}:
+                return False
+            parent = parents.get(part)
+            if part.attr == "error":
+                while isinstance(parent, ast.Tuple):
+                    parent = parents.get(parent)
+                return not isinstance(parent, ast.ExceptHandler)
+            # A stdlib function alias exposes its mutable module globals.
+            # Keep the namespace proof only while functions are direct callees.
+            return not (isinstance(parent, ast.Call) and parent.func is part)
+    return False
+
+
+def python_project_regex_patterns(text: str, node: ast.AST) -> None:
+    for part in ast.walk(node):
+        if not (isinstance(part, ast.Call) and isinstance(part.func, ast.Attribute)
+                and isinstance(part.func.value, ast.Name) and part.func.value.id == "re"
+                and len(part.args) == {"match": 2, "compile": 1}.get(part.func.attr)
+                and not part.keywords):
+            continue
+        pattern = part.args[0]
+        if not (isinstance(pattern, ast.Constant) and isinstance(pattern.value, str)
+                and python_regex_grammar_pattern(pattern.value) and python_stdlib_regex_source(text)):
+            continue
+        # This AST belongs to one parsed assignment. Only the proved pattern
+        # argument becomes metadata; input, suffixes and raw source stay checked.
+        part.args[0] = ast.copy_location(ast.Constant(value=None), pattern)
+
 
 def python_supported_resolver_import(part: ast.AST) -> bool:
     # Global/nonlocal nodes also expose names, but hold strings, not import aliases.
@@ -9638,7 +10173,7 @@ def compose_review_path(rel: str) -> bool:
         r"(?:docker-)?compose(?:\.[A-Za-z0-9_-]+)*\.ya?ml", Path(rel).name,
     ) is not None
 
-def unified_diff_contents(patch: str) -> tuple[str, str]:
+def unified_diff_contents(patch: str, *, complete_python_side: str | None = None) -> tuple[str, str]:
     old_content: list[str] = []
     new_content: list[str] = []
     in_hunk = False
@@ -9646,8 +10181,10 @@ def unified_diff_contents(patch: str) -> tuple[str, str]:
     for line in patch.splitlines():
         hunk_header = re.match(r"^(@{2,})", line)
         if hunk_header:
-            old_content.append(";")
-            new_content.append(";")
+            if complete_python_side != "-":
+                old_content.append(";")
+            if complete_python_side != "+":
+                new_content.append(";")
             in_hunk = True
             prefix_columns = len(hunk_header.group(1)) - 1
             continue
@@ -9760,13 +10297,25 @@ def diff_section_paths(section: str) -> tuple[str | None, str | None]:
             new_path = diff_marker_path(line[4:])
     return old_path, new_path
 
+def complete_python_diff_side(section: str, paths: tuple[str | None, str | None]) -> str | None:
+    # Only a complete creation/deletion proves the namespace starts at line one.
+    # Keep synthetic separators for every omitted, malformed or unknown side.
+    if not complete_case_diff_source(section):
+        return None
+    for prefix, path, other in (("-", paths[0], paths[1]), ("+", paths[1], paths[0])):
+        if path is not None and other is None and Path(path).suffix == ".py":
+            return prefix
+    return None
+
+
 def diff_section_source_contents(section: str) -> list[tuple[str | None, str]]:
     paths = diff_section_paths(section)
+    complete_side = complete_python_diff_side(section, paths)
     # Omitted lines can close a quoted block. Hunk fragments are not adjacent
     # source, so scan every old/new fragment without carrying quote state across gaps.
     hunks = re.split(r"(?m)(?=^@@)", section)[1:]
     return [(rel, content) for hunk in hunks
-            for rel, content in zip(paths, unified_diff_contents(hunk))]
+            for rel, content in zip(paths, unified_diff_contents(hunk, complete_python_side=complete_side))]
 
 
 class JsonObjectMembers(tuple):
@@ -9908,6 +10457,44 @@ def require_safe_diff(paths: list[str], patch: str, units: list[str]) -> None:
         require_safe_diff_section(expected, section)
 
 
+def complete_case_diff_side(header, coordinates):
+    if re.findall(r"(?m)^(---|\+\+\+) ", header) != ["---", "+++"]:
+        return None
+    old_start, old_count, new_start, new_count = coordinates
+    if re.search(r"(?m)^--- /dev/null\r?$", header) and (old_start, old_count, new_start) == (0, 0, 1):
+        return "+", new_count
+    if re.search(r"(?m)^\+\+\+ /dev/null\r?$", header) and (new_start, new_count, old_start) == (0, 0, 1):
+        return "-", old_count
+    return None
+
+
+def complete_case_diff_body(body, side):
+    prefix, expected_count = side
+    lines = [line for line in body.rstrip("\r\n").splitlines()
+             if line != r"\ No newline at end of file"]
+    return len(lines) == expected_count and all(line.startswith(prefix) for line in lines)
+
+
+def complete_case_diff_source(section):
+    # Missing lines can open a string before the hunk. Only one complete creation
+    # or deletion hunk can establish initial lexical context for a case label.
+    parts = re.split(r"(?m)(?=^@@)", section)
+    if len(parts) != 2:
+        return False
+    match = re.match(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@[^\r\n]*(?:\r?\n|$)", parts[1])
+    if match is None:
+        return False
+    coordinates = tuple(int(value) if value is not None else 1 for value in match.groups())
+    side = complete_case_diff_side(parts[0], coordinates)
+    if side is None:
+        return False
+    return complete_case_diff_body(parts[1][match.end():], side)
+
+
 def require_safe_diff_section(expected: set[str], section: str) -> None:
-    for rel, content in diff_section_source_contents(section):
-        require_safe_source("diff source", rel if rel in expected else "", content)
+    token = _CASE_LABEL_SOURCE_COMPLETE.set(complete_case_diff_source(section))
+    try:
+        for rel, content in diff_section_source_contents(section):
+            require_safe_source("diff source", rel if rel in expected else "", content)
+    finally:
+        _CASE_LABEL_SOURCE_COMPLETE.reset(token)

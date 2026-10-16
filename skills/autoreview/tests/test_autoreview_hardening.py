@@ -1561,8 +1561,8 @@ class AutoreviewBinaryDeletionTests(unittest.TestCase):
             git(repo, "rm", "--", asset.name)
             build = self.helper["build_bundle"]
 
-            def mutate(*args):
-                captured = build(*args)
+            def mutate(*args, **kwargs):
+                captured = build(*args, **kwargs)
                 asset.write_bytes(b"\0REAPPEARED_BINARY_BYTES")
                 return captured
 
@@ -1688,8 +1688,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 original = self.helper["capture_source_context"]
                 seen = []
 
-                def capture(repo, path, commit):
-                    record = original(repo, path, commit)
+                def capture(repo, path, commit, **kwargs):
+                    record = original(repo, path, commit, **kwargs)
                     seen.append(path)
                     if len(seen) == 1:
                         if change == "bytes":
@@ -1815,8 +1815,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 capture(repo, "src/token_count.py", absent_commit)
             original = self.helper["read_git_source"]
 
-            def corrupt(*args):
-                return original(*args)._replace(content="wrong object bytes\n")
+            def corrupt(*args, **kwargs):
+                return original(*args, **kwargs)._replace(content="wrong object bytes\n")
 
             with mock.patch.dict(capture.__globals__, {"read_git_source": corrupt}):
                 with self.assertRaisesRegex(SystemExit, "do not match the committed blob"):
@@ -1841,8 +1841,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 name = {"capture": "read_git_source", "preparation": "prepare_review_prompts"}.get(timing, "run_engine")
                 original = self.helper["main_impl"].__globals__[name]
 
-                def mutation(*args):
-                    result = original(*args)
+                def mutation(*args, **kwargs):
+                    result = original(*args, **kwargs)
                     mutate()
                     return result
 
@@ -2222,8 +2222,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
                             mutate()
                         return result
 
-                    def build(*args):
-                        result = original_build(*args)
+                    def build(*args, **kwargs):
+                        result = original_build(*args, **kwargs)
                         if timing == "construction":
                             mutate()
                         return result
@@ -2262,8 +2262,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 snapshot = self.helper["source_tree_snapshot"](repo)
                 original = self.helper["build_bundle"]
 
-                def build(*args):
-                    result = original(*args)
+                def build(*args, **kwargs):
+                    result = original(*args, **kwargs)
                     if change == "delete":
                         evidence.unlink()
                     elif change == "replace":
@@ -2390,8 +2390,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 name = "build_bundle" if timing == "construction" else "run_engine"
                 original = self.helper["main_impl"].__globals__[name]
 
-                def mutate(*args):
-                    result = original(*args)
+                def mutate(*args, **kwargs):
+                    result = original(*args, **kwargs)
                     source = repo / "unchanged-0.txt"
                     info = source.stat()
                     source.write_text("new\n")
@@ -4861,17 +4861,16 @@ class AutoreviewHardeningTests(unittest.TestCase):
         ):
             self.assertIn(config_path, validated)
 
-        token_term = "To" + "ken"
+        runtime_source = (FIXTURES / "typescript-complete-runtime-token-reference.ts").read_text(
+            encoding="utf-8"
+        )
         truncated_call_patch = (
             "diff --git a/src/token.ts b/src/token.ts\n"
-            "--- a/src/token.ts\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
             "+++ b/src/token.ts\n"
-            "@@ -40,3 +40,4 @@ function resolveAccountToken() {\n"
-            f"+  const account{token_term} = resolveRuntime{token_term}Value({{\n"
-            "+    value: accountConfig.token,\n"
-            "@@ -70,3 +71,4 @@ function resolveConfigToken() {\n"
-            f"+  const config{token_term} = resolveRuntime{token_term}Value({{\n"
-            "+    value: merged.token,\n"
+            f"@@ -0,0 +1,{len(runtime_source.splitlines())} @@\n"
+            + "".join(f"+{line}\n" for line in runtime_source.splitlines())
         )
         self.assertEqual(
             self.helper["validate_review_patch"](
@@ -4880,6 +4879,38 @@ class AutoreviewHardeningTests(unittest.TestCase):
             ),
             truncated_call_patch,
         )
+
+
+    def test_review_bundle_refuses_unbound_typescript_config_paths(self) -> None:
+        source = (FIXTURES / "typescript-incomplete-config-path-references.ts").read_text(
+            encoding="utf-8"
+        )
+        patch = (
+            "diff --git a/src/config-path-references.ts b/src/config-path-references.ts\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            "+++ b/src/config-path-references.ts\n"
+            f"@@ -0,0 +1,{len(source.splitlines())} @@\n"
+            + "".join(f"+{line}\n" for line in source.splitlines())
+        )
+        with self.assertRaises(SystemExit):
+            self.helper["validate_review_patch"](["src/config-path-references.ts"], patch)
+
+
+    def test_typescript_config_path_fixture_refuses_returned_metadata(self) -> None:
+        source = (FIXTURES / "typescript-benign-config-path-references.ts").read_text(
+            encoding="utf-8"
+        ).replace("return options.value;", "return options.path;")
+        patch = (
+            "diff --git a/src/config-path-references.ts b/src/config-path-references.ts\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            "+++ b/src/config-path-references.ts\n"
+            f"@@ -0,0 +1,{len(source.splitlines())} @@\n"
+            + "".join(f"+{line}\n" for line in source.splitlines())
+        )
+        with self.assertRaises(SystemExit):
+            self.helper["validate_review_patch"](["src/config-path-references.ts"], patch)
 
     def test_review_patch_preserves_safe_uri_userinfo(self) -> None:
         safe_lines = (
@@ -4938,9 +4969,10 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "diff --git a/runtime.py b/runtime.py\n"
             "--- a/runtime.py\n"
             "+++ b/runtime.py\n"
-            "@@ -0,0 +1 @@\n"
+            "@@ -0,0 +1,2 @@\n"
+            "+import os\n"
             + "+pass"
-            + 'word = getenv("PASSWORD") or "redacted"\n'
+            + 'word = os.getenv("PASSWORD") or "redacted"\n'
         )
 
         self.assertEqual(
@@ -4950,6 +4982,19 @@ class AutoreviewHardeningTests(unittest.TestCase):
             ),
             patch,
         )
+
+
+    def test_review_patch_refuses_unbound_placeholder_lookup(self) -> None:
+        patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1 @@\n"
+            + "+pass"
+            + 'word = getenv("PASSWORD") or "redacted"\n'
+        )
+        with self.assertRaises(SystemExit):
+            self.helper["validate_review_patch"](["runtime.py"], patch)
 
     def test_review_patch_preserves_ambiguous_short_markerless_lines(self) -> None:
         chunks = ["AB12", "CDef", "GH34", "ijKL", "MN56", "opQR"]
@@ -5055,7 +5100,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
         self.assertIn(identifier, redacted_patch)
 
-    def test_review_patch_preserves_bare_identifier_in_escaped_pem_concatenation(self) -> None:
+    def test_review_patch_refuses_private_key_marker_with_unbound_body(self) -> None:
         identifier = "AbCdEfGh" + "IjKlMnOp"
         patch = (
             "diff --git a/runtime.ts b/runtime.ts\n"
@@ -5069,12 +5114,28 @@ class AutoreviewHardeningTests(unittest.TestCase):
             + 'PRIVATE KEY-----";\n'
         )
 
-        redacted_patch = self.helper["validate_review_patch"](
-            ["runtime.ts"],
-            patch,
-        )
+        # Private-key framing is refused before the body reference is inspected.
+        with self.assertRaisesRegex(SystemExit, "secret-like content"):
+            self.helper["validate_review_patch"](
+                ["runtime.ts"], patch,
+            )
 
-        self.assertIn(identifier, redacted_patch)
+
+    def test_review_patch_refuses_unbound_pem_body(self) -> None:
+        identifier = "AbCdEfGh" + "IjKlMnOp"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            '+const fixture = "-----BEGIN '
+            + "PRIVATE KEY-----\\n\" + "
+            + identifier
+            + ' + "\\n-----END '
+            + 'PRIVATE KEY-----";\n'
+        )
+        with self.assertRaises(SystemExit):
+            self.helper["validate_review_patch"](["runtime.ts"], patch)
 
     def test_local_bundle_allows_deleted_test_token_fixture(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -8060,6 +8121,26 @@ os.execv(target, [str(target), *sys.argv[1:]])
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
             self.assertIn("inputs: FAILED", result.stdout)
             self.assertIn("missing-dataset.json", result.stdout)
+
+    def test_review_bundle_refuses_truncated_unbound_runtime_calls(self) -> None:
+        token_term = "To" + "ken"
+        truncated_call_patch = (
+            "diff --git a/src/token.ts b/src/token.ts\n"
+            "--- a/src/token.ts\n"
+            "+++ b/src/token.ts\n"
+            "@@ -40,3 +40,4 @@ function resolveAccountToken() {\n"
+            f"+  const account{token_term} = resolveRuntime{token_term}Value({{\n"
+            "+    value: accountConfig.token,\n"
+            "@@ -70,3 +71,4 @@ function resolveConfigToken() {\n"
+            f"+  const config{token_term} = resolveRuntime{token_term}Value({{\n"
+            "+    value: merged.token,\n"
+        )
+
+        with self.assertRaises(SystemExit):
+            self.helper["validate_review_patch"](
+                ["src/token.ts"], truncated_call_patch,
+            )
+
 
 PROXY_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
 

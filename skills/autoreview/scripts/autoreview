@@ -4687,6 +4687,10 @@ def toml_inline_string_table(values: dict[str, str]) -> str:
 
 def codex_config_isolation_flags(repo: Path, runtime_root: Path) -> list[str]:
     tool_env = toml_inline_string_table(codex_tool_git_env())
+    # Codex splits CLI override keys at literal dots, even inside quotes.
+    # Keep the path in the TOML value so it remains one untrusted project key.
+    project_settings = toml_inline_string_table({"trust_level": "untrusted"})
+    project_policy = f"{{{toml_string(str(repo.resolve()))}={project_settings}}}"
     filesystem = {":minimal": "read", ":workspace_roots": "read"}
     if sys.platform == "darwin":
         # Codex's macOS process defaults otherwise grant shared scratch access.
@@ -4717,7 +4721,7 @@ def codex_config_isolation_flags(repo: Path, runtime_root: Path) -> list[str]:
         "-c",
         "skills.config=[]",
         "-c",
-        f"projects.{toml_string(str(repo.resolve()))}.trust_level=\"untrusted\"",
+        f"projects={project_policy}",
         "-c",
         'shell_environment_policy.inherit="core"',
         "-c",
