@@ -380,8 +380,17 @@ class StageTests(unittest.TestCase):
         args=self.parse(['--engine-stage-dir',str(self.output),'--stream-engine-output','--status-output',str(self.root/'status.json'),'--json-output',str(self.root/'report.json')])
         report={'findings':[],'overall_correctness':'patch is correct','overall_explanation':'synthetic','overall_confidence':1.0}
         captured=types.SimpleNamespace(mixed=(),text='synthetic',images=())
-        evidence=types.SimpleNamespace(prompt='',datasets=[],files=[])
+        evidence=types.SimpleNamespace(prompt='',datasets=[],files=[object()])
         seen=[]
+        source_input_calls=[]
+        def bundle(repo,target,target_ref,commit_ref,*,source_inputs):
+            self.assertIs(source_inputs,evidence.files)
+            source_input_calls.append('bundle')
+            return captured
+        def verify(repo,records,*,source_inputs):
+            self.assertIs(source_inputs,evidence.files)
+            self.assertIs(records,captured.mixed)
+            source_input_calls.append('verify')
         def passes(args,reviewers,*remaining):
             seen.append(reviewers[0]._engine_stage)
             carrier=reviewers[0]._engine_stage; carrier.claim(); carrier.seen('launch_returned')
@@ -395,9 +404,9 @@ class StageTests(unittest.TestCase):
           'parse_args':lambda:args,'repo_root':lambda:self.root,'prepare_output_paths':lambda *a:None,
           'choose_target':lambda *a:('diff',None),'current_branch':lambda *a:'synthetic','codex_config_keys':lambda *a:[],
           'codex_speed_override':lambda *a:None,'capture_evidence_inputs':lambda *a:evidence,
-          'source_tree_snapshot':lambda *a:'same','build_bundle':lambda *a:captured,
+          'source_tree_snapshot':lambda *a:'same','build_bundle':bundle,
           'prepare_review_prompts':lambda *a:['synthetic'],'verify_evidence':lambda *a:None,
-          'verify_mixed_sources':lambda *a:None,'run_review_passes':passes,'print_report':lambda *a,**kw:None}
+          'verify_mixed_sources':verify,'run_review_passes':passes,'print_report':lambda *a,**kw:None}
         with contextlib.ExitStack() as stack:
             for name,value in replacements.items(): stack.enter_context(mock.patch.object(M,name,value))
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
@@ -409,6 +418,7 @@ class StageTests(unittest.TestCase):
                 self.assertTrue(caught.exception.timed_out)
                 result=1
             else: result=M.main_impl()
+        self.assertEqual(source_input_calls,['bundle','verify'] if unavailable else ['bundle','verify','verify'])
         return result,json.loads((self.root/'status.json').read_text()),seen
     def test_main_success_envelope_unchanged(self):
         result,status,seen=self.main_fixture()
@@ -660,9 +670,18 @@ class StageTests(unittest.TestCase):
                 args = self.parse(['--engine-stage-dir', str(stage_dir), '--stream-engine-output',
                     '--json-output', str(directory / 'report.json'),
                     '--status-output', str(directory / 'status.json')])
-                evidence = types.SimpleNamespace(prompt='', datasets=[], files=[])
+                evidence = types.SimpleNamespace(prompt='', datasets=[], files=[object()])
                 captured = types.SimpleNamespace(mixed=(), text='synthetic', images=())
                 calls = []
+                source_input_calls = []
+                def bundle(repo, target, target_ref, commit_ref, *, source_inputs):
+                    self.assertIs(source_inputs, evidence.files)
+                    source_input_calls.append('bundle')
+                    return captured
+                def verify(repo, records, *, source_inputs):
+                    self.assertIs(source_inputs, evidence.files)
+                    self.assertIs(records, captured.mixed)
+                    source_input_calls.append('verify')
                 report = {'findings': [], 'overall_correctness': 'patch is correct',
                           'overall_explanation': 'synthetic', 'overall_confidence': 1.0}
                 def passes(args, reviewers, *unused):
@@ -682,12 +701,12 @@ class StageTests(unittest.TestCase):
                 stubs = {'parse_args': lambda: args, 'preflight_git': lambda: calls.append('git') or True,
                     'repo_root': lambda: self.home, 'choose_target': lambda *a: ('branch', 'base'),
                     'current_branch': lambda *a: 'synthetic', 'capture_evidence_inputs': lambda *a: evidence,
-                    'source_tree_snapshot': lambda *a: 'same', 'build_bundle': lambda *a: captured,
+                    'source_tree_snapshot': lambda *a: 'same', 'build_bundle': bundle,
                     'require_image_engine': lambda *a: calls.append('images'),
                     'capture_source_context_inputs': source_context,
                     'prepare_review_prompts': lambda *a: ['synthetic'],
                     'check_review_plan': lambda *a: calls.append('plan'),
-                    'verify_evidence': lambda *a: None, 'verify_mixed_sources': lambda *a: None,
+                    'verify_evidence': lambda *a: None, 'verify_mixed_sources': verify,
                     'run_review_passes': passes, 'print_report': lambda *a, **kw: None}
                 out = io.StringIO()
                 with contextlib.ExitStack() as stack:
@@ -701,6 +720,8 @@ class StageTests(unittest.TestCase):
                         error = M.EngineInterrupted if outcome == 'interrupted' else M.ReviewerUnavailable
                         with self.assertRaises(error):
                             M.main_impl()
+                self.assertEqual(source_input_calls, ['bundle', 'verify', 'verify']
+                    if outcome == 'incomplete' else ['bundle', 'verify'])
                 self.assertEqual(calls, ['git', 'images', 'source-context', 'plan'])
                 self.assertIn('review usage:', out.getvalue())
                 sidecar = json.loads((stage_dir / 'engine-stage.json').read_text())
